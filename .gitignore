@@ -1,0 +1,5 @@
+.venv/
+VectorDB/
+Logs/
+__pycache__/
+*.pyc

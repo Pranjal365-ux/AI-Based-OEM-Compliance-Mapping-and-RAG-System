@@ -1,0 +1,24 @@
+# ── Core PDF extraction ───────────────────────────────────────────────────────
+pymupdf>=1.23.0            # PyMuPDF — text + table extraction (find_tables requires 1.23+)
+pdfplumber>=0.10.0         # fallback for complex table layouts
+
+# ── OCR fallback ──────────────────────────────────────────────────────────────
+paddlepaddle>=2.5.0        # PaddleOCR backend (CPU version)
+paddleocr>=2.7.0           # PaddleOCR frontend
+pillow>=10.0.0             # image handling for OCR
+pdf2image>=1.16.0          # PDF page → PIL image (alternative render path)
+
+# ── Text splitting ────────────────────────────────────────────────────────────
+langchain-text-splitters>=0.2.0
+
+# ── Embedding ─────────────────────────────────────────────────────────────────
+sentence-transformers>=2.7.0
+
+# ── Vector database ───────────────────────────────────────────────────────────
+chromadb>=0.5.0
+
+# ── Near-duplicate detection ──────────────────────────────────────────────────
+# (built-in only — no extra package needed for Jaccard-based dedup)
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm>=4.66.0               # progress bars
