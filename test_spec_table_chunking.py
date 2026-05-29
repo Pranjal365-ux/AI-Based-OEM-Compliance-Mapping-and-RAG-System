@@ -167,3 +167,91 @@ FG-7121F | 700 Gbps | 450 Gbps
         (c["metadata"]["model"], c["metadata"]["spec_name"], c["metadata"]["spec_value"])
         for c in spec_rows
     }
+
+
+def test_model_metric_value_rows_are_not_reversed():
+    pages = [
+        {
+            "page": 1,
+            "text": """
+[TABLE]
+PA-3220 | 7.5 Gbps | Firewall throughput (appmix)*
+--- | --- | ---
+PA-3250 | 9.0 Gbps | Firewall throughput (appmix)*
+PA-3260 | 10.5 Gbps | Firewall throughput (appmix)*
+[/TABLE]
+""",
+        }
+    ]
+    meta = _doc_meta(["PA-3220", "PA-3250", "PA-3260"])
+    meta["vendor"] = "Palo Alto"
+    meta["family"] = "PA-3200 Series"
+    meta["product_family"] = "PA-3200 Series"
+
+    chunks = chunk_pages(pages, meta)
+    spec_rows = [c for c in chunks if c["metadata"]["chunk_type"] == "spec_row"]
+
+    assert len(spec_rows) == 3
+    assert ("PA-3220", "Firewall throughput (appmix)*", "7.5 Gbps") in {
+        (c["metadata"]["model"], c["metadata"]["spec_name"], c["metadata"]["spec_value"])
+        for c in spec_rows
+    }
+    assert all(not c["metadata"]["spec_name"].endswith("Gbps") for c in spec_rows)
+
+
+def test_fortinet_grouped_page_headers_fan_out_to_models():
+    pages = [
+        {
+            "page": 1,
+            "text": """
+FG-7081F/
+FG-7081F-DC
+FG-7081F-2/
+FG-7081F-2-DC
+
+[TABLE]
+Hardware Interfaces |  | 
+--- | --- | ---
+IPS Throughput (Enterprise Mix) | 405 Gbps | 405 Gbps
+SSL Inspection Throughput | 324 Gbps | 324 Gbps
+[/TABLE]
+""",
+        }
+    ]
+    meta = _doc_meta(["FG-7081F", "FG-7081F-DC", "FG-7081F-2", "FG-7081F-2-DC"])
+
+    chunks = chunk_pages(pages, meta)
+    spec_rows = [c for c in chunks if c["metadata"]["chunk_type"] == "spec_row"]
+
+    assert len(spec_rows) == 8
+    assert ("FG-7081F-DC", "SSL Inspection Throughput", "324 Gbps") in {
+        (c["metadata"]["model"], c["metadata"]["spec_name"], c["metadata"]["spec_value"])
+        for c in spec_rows
+    }
+    assert ("FG-7081F-2-DC", "IPS Throughput (Enterprise Mix)", "405 Gbps") in {
+        (c["metadata"]["model"], c["metadata"]["spec_name"], c["metadata"]["spec_value"])
+        for c in spec_rows
+    }
+
+
+def test_pymupdf_col_placeholders_do_not_become_specs():
+    pages = [
+        {
+            "page": 1,
+            "text": """
+FG-7081F/
+FG-7081F-DC
+
+[TABLE]
+Col0 | Col1
+--- | ---
+Col0 | Col0
+[/TABLE]
+""",
+        }
+    ]
+
+    chunks = chunk_pages(pages, _doc_meta(["FG-7081F", "FG-7081F-DC"]))
+    spec_rows = [c for c in chunks if c["metadata"]["chunk_type"] == "spec_row"]
+
+    assert spec_rows == []

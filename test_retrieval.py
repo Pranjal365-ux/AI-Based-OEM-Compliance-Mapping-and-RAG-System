@@ -8,8 +8,9 @@ if sys.platform.startswith("win"):
     except AttributeError:
         pass
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
+model = SentenceTransformer(
+    "BAAI/bge-base-en-v1.5"
+)
 client = chromadb.PersistentClient(path="./VectorDB")
 
 collection = client.get_collection("oem_knowledge_base")
