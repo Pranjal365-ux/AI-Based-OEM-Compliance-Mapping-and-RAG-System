@@ -19,7 +19,7 @@ _MODEL_BLOCKLIST = re.compile(
     r"|[A-Z]{2,3}\d{6,}"          # long part numbers: BIGIP-268260962
     r"|AES\d+"                    # crypto: AES256
     r"|NAT\d{2}"                  # NAT modes: NAT44, NAT64
-    r"|[A-Z]{2,4}-\d{3}"          # cert suffixes: RS-232, TS-07
+    r"|RS-232"                    # cert/port: RS-232
     r"|ICES-\d+"                  # cert: ICES-003
     r"|SHA\d+"                    # crypto: SHA256
     r"|HTTP\s?\d+"                # protocol: HTTP 64K
@@ -197,7 +197,7 @@ def extract_doc_meta(pages: list, filename: str) -> dict:
     head_text = "\n".join(p["text"] for p in pages[:3])
     full_text = "\n".join(p["text"] for p in pages)
 
-    vendor         = _extract_vendor(head_text)
+    vendor         = _extract_vendor(full_text)
     models         = _extract_models(full_text)
     product_family = _extract_product_family(head_text, vendor)
 
