@@ -77,6 +77,21 @@ GENERIC_TABLE_HEADERS = {
     "NOTES",
 }
 
+SECTION_LABELS = {
+    "PERFORMANCE",
+    "CAPACITY",
+    "INTERFACES",
+    "HARDWARE",
+    "SYSTEM",
+    "DIMENSIONS",
+    "POWER",
+    "ENVIRONMENT",
+    "COMPLIANCE",
+    "CERTIFICATIONS",
+    "ORDER INFORMATION",
+    "ORDERING INFORMATION",
+}
+
 MODEL_CODE_RE = re.compile(
     r"(?<![A-Z0-9-])("
     r"F[GPIM]{1,3}-\d{3,5}[A-Z]{0,4}(?:-\d{1,2})?(?:-DC)?"
@@ -91,6 +106,8 @@ MODEL_VALUE_BLOCKLIST_RE = re.compile(
     r"^(?:AES|SHA)[-\s]?\d+$|^\d+[GK]$|^\d{1,4}[WV]$|^(?:EN|IEC)\s?\d+",
     re.IGNORECASE,
 )
+
+COMPONENT_CODE_RE = re.compile(r"^F(?:IM|PM)-\d{3,5}[A-Z]{0,3}(?:-\d{1,2})?(?:-DC)?$", re.IGNORECASE)
 
 
 # ── Deduplication helpers ─────────────────────────────────────────────────────
@@ -152,24 +169,20 @@ def _parse_markdown_table(table_text: str):
         s = row.strip().strip("|")
         return [cell.strip() for cell in s.split("|")]
 
-    headers = split_row(lines[0])
+    parsed_rows = [split_row(line) for line in lines]
+    width = max(len(row) for row in parsed_rows)
+    parsed_rows = [row + [""] * (width - len(row)) for row in parsed_rows]
 
     # Detect and skip separator row (--- / :--- / ---:)
     data_start = 1
-    if len(lines) > 1:
-        sep_cells = split_row(lines[1])
-        if all(re.match(r"^[\s\-\:\+]+$", c) for c in sep_cells if c):
+    if len(parsed_rows) > 1:
+        sep_cells = parsed_rows[1]
+        nonblank_sep = [c for c in sep_cells if c]
+        if nonblank_sep and all(re.match(r"^[\s\-\:\+]+$", c) for c in nonblank_sep):
             data_start = 2
 
-    data_rows = []
-    for line in lines[data_start:]:
-        cells = split_row(line)
-        # Pad or trim to match header count
-        if len(cells) < len(headers):
-            cells += [""] * (len(headers) - len(cells))
-        else:
-            cells = cells[:len(headers)]
-        data_rows.append(cells)
+    headers = parsed_rows[0]
+    data_rows = parsed_rows[data_start:]
 
     return headers, data_rows
 
@@ -206,8 +219,26 @@ def _is_generic_header(text: str) -> bool:
     return _normalise_label(text) in GENERIC_TABLE_HEADERS
 
 
+def _is_section_label(text: str) -> bool:
+    return _normalise_label(text) in SECTION_LABELS
+
+
 def _is_blocked_model_value(text: str) -> bool:
     return bool(MODEL_VALUE_BLOCKLIST_RE.match(text.strip()))
+
+
+def _is_component_code(text: str) -> bool:
+    return bool(COMPONENT_CODE_RE.fullmatch(text.strip()))
+
+
+def _known_model_set(doc_meta: dict) -> set:
+    family_ids = {m.upper() for m in doc_meta.get("family_identifiers", [])}
+    components = {m.upper() for m in doc_meta.get("components", [])}
+    return {
+        m.upper()
+        for m in doc_meta.get("models", [])
+        if m and m.upper() not in family_ids and m.upper() not in components and not _is_component_code(m)
+    }
 
 
 def _extract_models_from_cell(cell: str, known_models: list) -> list:
@@ -217,6 +248,7 @@ def _extract_models_from_cell(cell: str, known_models: list) -> list:
 
     found = []
     consumed = cell
+    allowed = {m.upper() for m in known_models}
     for known_model in sorted(known_models, key=len, reverse=True):
         pattern = rf"(?<![A-Z0-9-]){re.escape(known_model)}(?![A-Z0-9-])"
         if re.search(pattern, consumed, flags=re.IGNORECASE):
@@ -225,39 +257,73 @@ def _extract_models_from_cell(cell: str, known_models: list) -> list:
 
     for m in MODEL_CODE_RE.finditer(consumed):
         model = m.group(1).strip()
-        if _is_blocked_model_value(model) or _is_generic_header(model):
-            continue
         canonical = model.upper() if model.lower().startswith("pa-") else model
+        if _is_blocked_model_value(model) or _is_generic_header(model) or _is_component_code(model):
+            continue
+        if allowed and canonical.upper() not in allowed:
+            continue
         if canonical not in found:
             found.append(canonical)
 
     return found
 
 
-def _infer_column_model_map(headers: list, data_rows: list, known_models: list) -> tuple[list, int]:
+def _infer_column_model_map(headers: list, data_rows: list, known_models: list) -> tuple[dict, int, int]:
     """
-    Find the row that names model columns.
+    Find model columns across a small header band.
 
-    Returns (col_models, data_start_offset). data_start_offset is 0 when the
-    Markdown header row is the model header, or N when data_rows[N - 1] was
-    promoted to the model header and should be skipped as data.
+    Returns (col_model_map, metric_col, data_start_offset).
+    col_model_map maps physical column indexes to one or more appliance models.
     """
-    candidates = [(headers, 0)] + [(row, i + 1) for i, row in enumerate(data_rows[:3])]
-    best_models = []
-    best_offset = 0
+    rows = [headers] + data_rows
+    scan_limit = min(len(rows), 8)
+    col_model_map = {}
+    last_model_header_row = -1
+
+    for row_idx in range(scan_limit):
+        row = rows[row_idx]
+        for col_idx, cell in enumerate(row):
+            models = _extract_models_from_cell(cell, known_models)
+            if models:
+                existing = col_model_map.setdefault(col_idx, [])
+                for model in models:
+                    if model not in existing:
+                        existing.append(model)
+                last_model_header_row = max(last_model_header_row, row_idx)
+
+    if not col_model_map:
+        return {}, 0, 0
+
+    metric_candidates = [i for i in range(max(len(row) for row in rows)) if i not in col_model_map]
+    metric_col = min(metric_candidates) if metric_candidates else 0
+    data_start_offset = max(0, last_model_header_row)
+    return col_model_map, metric_col, data_start_offset
+
+
+def _infer_row_model_table(headers: list, data_rows: list, known_models: list) -> tuple[int, list]:
+    """Detect tables shaped as Model | Spec A | Spec B."""
+    rows = [headers] + data_rows[:5]
+    best_col = -1
     best_score = 0
 
-    for row, offset in candidates:
-        if len(row) < 2:
-            continue
-        col_models = [_extract_models_from_cell(cell, known_models) for cell in row[1:]]
-        score = sum(len(models) for models in col_models)
+    for col_idx in range(max(len(row) for row in rows)):
+        score = 0
+        for row in rows:
+            if col_idx < len(row) and _extract_models_from_cell(row[col_idx], known_models):
+                score += 1
         if score > best_score:
             best_score = score
-            best_models = col_models
-            best_offset = offset
+            best_col = col_idx
 
-    return best_models, best_offset
+    spec_headers = []
+    if best_col >= 0 and best_score >= 2:
+        spec_headers = [
+            _clean_metric_name(h)
+            for i, h in enumerate(headers)
+            if i != best_col and h and not _is_generic_header(h)
+        ]
+
+    return best_col, spec_headers
 
 
 def _split_into_segments(text: str) -> list:
@@ -300,6 +366,7 @@ def _base_meta(doc_meta: dict, page: int, chunk_idx: int,
         ),
 
         "model": "",
+        "component": "",
 
         "category": doc_meta["category"],
         "doc_name": doc_meta["doc_name"],
@@ -329,7 +396,7 @@ def chunk_pages(pages: list, doc_meta: dict) -> list:
     vendor         = doc_meta["vendor"]
     product_family = doc_meta.get("product_family", "")
     category       = doc_meta["category"]
-    models         = doc_meta.get("models", [])  # may be empty
+    models         = sorted(_known_model_set(doc_meta), key=len, reverse=True)
     display_family = doc_meta.get("display_family",doc_meta.get("product_family","UNKNOWN"))
 
     # Context string for spec rows — used as "grounding" text for the LLM
@@ -387,8 +454,46 @@ def chunk_pages(pages: list, doc_meta: dict) -> list:
         # Determine model names from header columns.
         # Convention: col 0 = metric name, col 1..N = model/value columns.
         # If PyMuPDF emitted generic headers, promote the first detected model row.
-        col_models, data_start_offset = _infer_column_model_map(headers, data_rows, models)
-        if not any(col_models):
+        col_model_map, metric_col, data_start_offset = _infer_column_model_map(headers, data_rows, models)
+        row_model_col, spec_headers = _infer_row_model_table(headers, data_rows, models)
+        if row_model_col >= 0 and spec_headers and (not col_model_map or set(col_model_map) == {row_model_col}):
+                for cells in data_rows:
+                    if row_model_col >= len(cells):
+                        continue
+                    row_models = _extract_models_from_cell(cells[row_model_col], models)
+                    if not row_models:
+                        continue
+                    for col_i, header in enumerate(headers):
+                        if col_i == row_model_col or col_i >= len(cells):
+                            continue
+                        metric_name = _clean_metric_name(header)
+                        val = _clean_cell_value(cells[col_i])
+                        if not metric_name or _is_generic_header(metric_name) or _is_blank_value(val):
+                            continue
+                        for row_model in row_models:
+                            chunk_text = (
+                                f"Vendor: {vendor}\n"
+                                f"Product: {product_family}\n"
+                                f"Model: {row_model}\n\n"
+                                f"Feature: {metric_name}\n"
+                                f"Value: {val}\n\n"
+                                f"Context: {context_str}"
+                            )
+                            chunk_id = _make_chunk_id(doc_meta["doc_name"], page_num, chunk_text)
+                            meta = _base_meta(doc_meta, page_num, idx, True, "spec_row")
+                            meta.update({
+                                "model": row_model,
+                                "metric": metric_name,
+                                "value": val,
+                                "spec_name": metric_name,
+                                "spec_value": val,
+                                "chunk_id": chunk_id,
+                            })
+                            final_chunks.append({"text": chunk_text, "metadata": meta})
+                            idx += 1
+                continue
+
+        if not col_model_map:
             logger.debug(
                 f"  [chunker] table page {page_num}: no model columns detected; "
                 "kept table_full only"
@@ -399,12 +504,14 @@ def chunk_pages(pages: list, doc_meta: dict) -> list:
             if not cells:
                 continue
 
-            metric_raw  = cells[0].strip()
+            metric_raw = cells[metric_col].strip() if metric_col < len(cells) else ""
             if (
                 not metric_raw
                 or re.match(r"^[\s\-\:\+]+$", metric_raw)
                 or re.match(r"^Col\d+$", metric_raw)
                 or _is_generic_header(metric_raw)
+                or _is_section_label(metric_raw)
+                or _extract_models_from_cell(metric_raw, models)
             ):
                 continue
 
@@ -413,11 +520,11 @@ def chunk_pages(pages: list, doc_meta: dict) -> list:
                 continue
 
             # One chunk per value column per model
-            for col_i, col_model_list in enumerate(col_models):
+            for col_i, col_model_list in sorted(col_model_map.items()):
                 if not col_model_list:
                     continue
                     
-                val_raw = cells[col_i + 1] if col_i + 1 < len(cells) else ""
+                val_raw = cells[col_i] if col_i < len(cells) else ""
                 val     = _clean_cell_value(val_raw)
 
                 if _is_blank_value(val):

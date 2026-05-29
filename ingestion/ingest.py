@@ -120,6 +120,7 @@ def ingest_file(pdf_path:Path)->dict:
             doc_identity["product_family"]
         ),
         "models":         doc_identity["models"],
+        "components":     doc_identity.get("components", []),
         "family_identifiers": doc_identity.get("family_identifiers", []),
         "category":       category,
         "doc_name":       pdf_path.name,

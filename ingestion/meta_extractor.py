@@ -27,6 +27,17 @@ GENERIC_MODEL_HEADERS = {
     "NOTES",
 }
 
+_MARKETING_FAMILY_HEADINGS = {
+    "HIGHLIGHTS",
+    "OVERVIEW",
+    "PRODUCT OVERVIEW",
+    "FEATURES",
+    "BENEFITS",
+    "SPECIFICATIONS",
+    "TECHNICAL SPECIFICATIONS",
+    "ORDERING INFORMATION",
+}
+
 _MODEL_BLOCKLIST = re.compile(
     r"^("
     r"\d{1,4}[WV]$"
@@ -97,6 +108,14 @@ def is_valid_model_code(model: str) -> bool:
     if _MODEL_BLOCKLIST.match(model):
         return False
     return bool(_MODEL_CODE_RE.fullmatch(model))
+
+
+def is_component_code(model: str) -> bool:
+    return bool(re.fullmatch(r"F(?:IM|PM)-\d{3,5}[A-Z]{0,3}(?:-\d{1,2})?(?:-DC)?", model.strip(), re.IGNORECASE))
+
+
+def is_family_identifier(model: str, family_identifiers: set[str]) -> bool:
+    return model.strip().upper() in {fid.upper() for fid in family_identifiers}
 
 
 def _candidate_score(text: str, weight: int) -> tuple:
@@ -174,7 +193,40 @@ def _extract_vendor(text: str) -> str:
     return best[0]
 
 
-def _extract_product_family(text: str, vendor: str) -> str:
+def _family_from_filename(filename: str) -> str:
+    stem = Path(filename).stem.lower().replace("_", "-")
+    m = re.search(r"\bpa-(\d{3,5})-series\b", stem)
+    if m:
+        return f"PA-{m.group(1)} Series"
+
+    m = re.search(r"\bfortigate-(\d{3,5}[a-z]?)-series\b", stem)
+    if m:
+        return f"FortiGate {m.group(1).upper()} Series"
+
+    return ""
+
+
+def _family_from_text(text: str) -> str:
+    patterns = [
+        r"\b(FortiGate\s+\d{3,5}[A-Z]?\s+Series)\b",
+        r"\b(PA-\d{3,5}\s+Series)\b",
+        r"\b(FG-\d{3,5}[A-Z]?\s+Series)\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            family = re.sub(r"\s+", " ", m.group(1)).strip()
+            family = re.sub(r"\bpa-", "PA-", family, flags=re.IGNORECASE)
+            family = re.sub(r"\bfg-", "FG-", family, flags=re.IGNORECASE)
+            return family
+    return ""
+
+
+def _extract_product_family(text: str, vendor: str, filename: str = "") -> str:
+    explicit = _family_from_filename(filename) or _family_from_text(text[:5000])
+    if explicit:
+        return explicit
+
     head = text[:600]
     lines = [line.strip() for line in head.split("\n") if line.strip()]
     generic = {
@@ -193,6 +245,8 @@ def _extract_product_family(text: str, vendor: str) -> str:
     for line in lines[:20]:
         line_lower = line.lower()
         if vendor and line_lower == vendor.lower():
+            continue
+        if _normalise_label(line) in _MARKETING_FAMILY_HEADINGS:
             continue
         if line_lower in generic:
             continue
@@ -233,9 +287,20 @@ def _extract_models(full_text: str, product_family: str = "") -> list:
         model = m.group(1).strip()
         if model.upper() in family_ids:
             continue
+        if is_component_code(model):
+            continue
         if is_valid_model_code(model):
             found.add(model.upper() if model.lower().startswith("pa-") else model)
 
+    return sorted(found)
+
+
+def _extract_components(full_text: str) -> list:
+    found = set()
+    for m in _MODEL_CODE_RE.finditer(full_text.replace("\n", " ")):
+        code = m.group(1).strip()
+        if is_component_code(code):
+            found.add(code)
     return sorted(found)
 
 
@@ -245,9 +310,10 @@ def extract_doc_meta(pages: list, filename: str) -> dict:
     logo_text = pages[0].get("logo_text", "") if pages else ""
 
     vendor = _extract_vendor_from_logo(logo_text) or _extract_vendor(full_text)
-    product_family = _extract_product_family(head_text, vendor) or "UNKNOWN"
+    product_family = _extract_product_family(head_text + "\n" + full_text, vendor, filename) or "UNKNOWN"
     models = _extract_models(full_text, product_family)
     family_identifiers = sorted(_extract_family_identifiers(full_text, product_family))
+    components = _extract_components(full_text)
 
     source = "content"
     if not vendor:
@@ -260,13 +326,15 @@ def extract_doc_meta(pages: list, filename: str) -> dict:
     logger.info(
         f"  [meta] vendor='{vendor}' | family='{product_family}' | "
         f"family_ids={family_identifiers} | models={models[:8]}"
-        f"{'...' if len(models) > 8 else ''} | source={source}"
+        f"{'...' if len(models) > 8 else ''} | components={components[:6]}"
+        f"{'...' if len(components) > 6 else ''} | source={source}"
     )
 
     return {
         "vendor": vendor,
         "family": product_family,
         "models": models,
+        "components": components,
         "family_identifiers": family_identifiers,
         "product_family": product_family,
         "display_family": product_family,

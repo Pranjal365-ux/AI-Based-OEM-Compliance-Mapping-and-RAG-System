@@ -36,6 +36,7 @@ def test_crypto_and_family_ids_are_not_models():
     assert "SHA-512" not in models
     assert "FG-7000F" not in models
     assert "PA-3200" not in models
+    assert "FIM-7921F" not in _extract_models("FIM-7921F FPM-7620F FG-7081F", "")
     assert "FG-7081F" in models
     assert "FG-7081F-DC" in models
     assert "PA-3220" in models
@@ -115,3 +116,54 @@ IPsec VPN throughput | 1.2 Gbps | 2 Gbps
 
     assert len(spec_rows) == 4
     assert {c["metadata"]["model"] for c in spec_rows} == {"PA-3220", "PA-3250"}
+
+
+def test_wide_rows_are_not_trimmed_by_title_header():
+    pages = [
+        {
+            "page": 1,
+            "text": """
+[TABLE]
+FortiGate 7000F Series
+--- | --- | --- | ---
+Specification | FG-7081F | FG-7081F-DC | FG-7121F
+Firewall Throughput | 500 Gbps | 500 Gbps | 700 Gbps
+IPS Throughput | 300 Gbps | 300 Gbps | 450 Gbps
+[/TABLE]
+""",
+        }
+    ]
+
+    chunks = chunk_pages(pages, _doc_meta())
+    spec_rows = [c for c in chunks if c["metadata"]["chunk_type"] == "spec_row"]
+
+    assert len(spec_rows) == 6
+    assert ("FG-7121F", "IPS Throughput", "450 Gbps") in {
+        (c["metadata"]["model"], c["metadata"]["spec_name"], c["metadata"]["spec_value"])
+        for c in spec_rows
+    }
+
+
+def test_row_oriented_model_table_generates_specs():
+    pages = [
+        {
+            "page": 1,
+            "text": """
+[TABLE]
+Model | Firewall Throughput | IPS Throughput
+--- | --- | ---
+FG-7081F | 500 Gbps | 300 Gbps
+FG-7121F | 700 Gbps | 450 Gbps
+[/TABLE]
+""",
+        }
+    ]
+
+    chunks = chunk_pages(pages, _doc_meta())
+    spec_rows = [c for c in chunks if c["metadata"]["chunk_type"] == "spec_row"]
+
+    assert len(spec_rows) == 4
+    assert ("FG-7121F", "IPS Throughput", "450 Gbps") in {
+        (c["metadata"]["model"], c["metadata"]["spec_name"], c["metadata"]["spec_value"])
+        for c in spec_rows
+    }

@@ -221,8 +221,14 @@ def get_collection_stats()->dict:
         )
 
         model = meta.get("model","")
+        component = meta.get("component","")
+        family = meta.get("family", meta.get("product_family", ""))
         if model:
             combo = f"{vendor} {model}"
+        elif component:
+            combo = f"{vendor} component {component}"
+        elif family:
+            combo = f"{vendor} {family}"
         else:
             combo = f"{vendor} {category}"
 
