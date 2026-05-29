@@ -105,16 +105,24 @@ def ingest_file(pdf_path:Path)->dict:
         # FIXED HERE
 
         # Step 4 — Extract vendor + models from content (NO filename parsing)
-        doc_identity = extract_doc_meta(raw_pages, pdf_path.name)
+        doc_identity = extract_doc_meta(raw_pages, str(pdf_path))
+        if not doc_identity["models"]:
+            doc_identity["display_family"] = category
         result["vendor"] = doc_identity["vendor"]
         result["models"] = doc_identity["models"]
 
         doc_meta = {
-            "vendor":         doc_identity["vendor"],
-            "product_family": doc_identity["product_family"],
-            "models":         doc_identity["models"],
-            "category":       category,
-            "doc_name":       pdf_path.name,
+        "vendor":         doc_identity["vendor"],
+        "family":         doc_identity.get("family", doc_identity["product_family"]),
+        "product_family": doc_identity["product_family"],
+        "display_family": doc_identity.get(
+            "display_family",
+            doc_identity["product_family"]
+        ),
+        "models":         doc_identity["models"],
+        "family_identifiers": doc_identity.get("family_identifiers", []),
+        "category":       category,
+        "doc_name":       pdf_path.name,
         }
 
 
@@ -244,7 +252,7 @@ def print_stats():
 
 
     logger.info(
-        "  By family:"
+        "  By model:"
     )
 
     for k,v in sorted(
@@ -304,4 +312,3 @@ if __name__=="__main__":
         reset_db()
 
     ingest_all()
-

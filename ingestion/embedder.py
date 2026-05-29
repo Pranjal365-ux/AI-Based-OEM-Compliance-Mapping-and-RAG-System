@@ -204,21 +204,44 @@ def get_collection_stats()->dict:
 
 
     for meta in results["metadatas"]:
-        category = meta.get("category", "UNKNOWN")
-        vendor = meta.get("vendor", "UNKNOWN")
-        chunk_type = meta.get("chunk_type", "UNKNOWN")
-        product_family = meta.get("product_family", "")
 
-        if product_family and product_family != "UNKNOWN":
-            combo = f"{vendor} {product_family}"
+        category = meta.get(
+            "category",
+            "UNKNOWN"
+        )
+
+        vendor = meta.get(
+            "vendor",
+            "UNKNOWN"
+        )
+
+        chunk_type = meta.get(
+            "chunk_type",
+            "UNKNOWN"
+        )
+
+        model = meta.get("model","")
+        if model:
+            combo = f"{vendor} {model}"
         else:
             combo = f"{vendor} {category}"
 
-        cat_counts[category] = cat_counts.get(category, 0) + 1
-        vendor_counts[vendor] = vendor_counts.get(vendor, 0) + 1
-        type_counts[chunk_type] = type_counts.get(chunk_type, 0) + 1
-        combo_counts[combo] = combo_counts.get(combo, 0) + 1
+        cat_counts[category] = (
+            cat_counts.get(category, 0) + 1
+        )
 
+        vendor_counts[vendor] = (
+            vendor_counts.get(vendor, 0) + 1
+        )
+
+        type_counts[chunk_type] = (
+            type_counts.get(chunk_type, 0) + 1
+        )
+
+        combo_counts[combo] = (
+            combo_counts.get(combo, 0) + 1
+        )
+        
     return {
         "total": total,
         "by_category": cat_counts,

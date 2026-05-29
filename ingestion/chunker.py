@@ -24,7 +24,27 @@
 import re
 import logging
 import hashlib
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    class RecursiveCharacterTextSplitter:
+        def __init__(self, chunk_size, chunk_overlap, **_):
+            self.chunk_size = chunk_size
+            self.chunk_overlap = chunk_overlap
+
+        def split_text(self, text):
+            text = text.strip()
+            if len(text) <= self.chunk_size:
+                return [text] if text else []
+            chunks = []
+            start = 0
+            while start < len(text):
+                end = min(len(text), start + self.chunk_size)
+                chunks.append(text[start:end].strip())
+                if end == len(text):
+                    break
+                start = max(end - self.chunk_overlap, start + 1)
+            return [c for c in chunks if c]
 from config import CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_CHARS, DEDUP_THRESHOLD
 
 logger = logging.getLogger("ingestion")
@@ -39,6 +59,38 @@ _splitter = RecursiveCharacterTextSplitter(
 
 TABLE_BLOCK_RE = re.compile(r"(\[TABLE\].*?\[/TABLE\])", re.DOTALL)
 TABLE_OPEN_RE  = re.compile(r"^\[TABLE\]")
+
+GENERIC_TABLE_HEADERS = {
+    "DESCRIPTION",
+    "SKU",
+    "URL",
+    "VALUE",
+    "FEATURE",
+    "SPECIFICATION",
+    "SPECIFICATIONS",
+    "MODEL",
+    "MODEL NUMBER",
+    "PART NUMBER",
+    "PRODUCT",
+    "PRODUCT FAMILY",
+    "ITEM",
+    "NOTES",
+}
+
+MODEL_CODE_RE = re.compile(
+    r"(?<![A-Z0-9-])("
+    r"F[GPIM]{1,3}-\d{3,5}[A-Z]{0,4}(?:-\d{1,2})?(?:-DC)?"
+    r"|PA-\d{3,5}[A-Z]{0,2}"
+    r"|(?:BIG-IP\s+)?[ir]\d{4,5}"
+    r"|[A-Z]{2,6}-\d{3,5}[A-Z]{0,3}(?:-DC)?"
+    r")(?![A-Z0-9-])",
+    re.IGNORECASE,
+)
+
+MODEL_VALUE_BLOCKLIST_RE = re.compile(
+    r"^(?:AES|SHA)[-\s]?\d+$|^\d+[GK]$|^\d{1,4}[WV]$|^(?:EN|IEC)\s?\d+",
+    re.IGNORECASE,
+)
 
 
 # ── Deduplication helpers ─────────────────────────────────────────────────────
@@ -146,6 +198,68 @@ def _is_blank_value(val: str) -> bool:
 
 # ── Segment splitter ──────────────────────────────────────────────────────────
 
+def _normalise_label(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", text.upper())).strip()
+
+
+def _is_generic_header(text: str) -> bool:
+    return _normalise_label(text) in GENERIC_TABLE_HEADERS
+
+
+def _is_blocked_model_value(text: str) -> bool:
+    return bool(MODEL_VALUE_BLOCKLIST_RE.match(text.strip()))
+
+
+def _extract_models_from_cell(cell: str, known_models: list) -> list:
+    """Return proven model identifiers from a table header cell."""
+    if not cell or _is_generic_header(cell) or _is_blocked_model_value(cell):
+        return []
+
+    found = []
+    consumed = cell
+    for known_model in sorted(known_models, key=len, reverse=True):
+        pattern = rf"(?<![A-Z0-9-]){re.escape(known_model)}(?![A-Z0-9-])"
+        if re.search(pattern, consumed, flags=re.IGNORECASE):
+            found.append(known_model)
+            consumed = re.sub(pattern, " ", consumed, flags=re.IGNORECASE)
+
+    for m in MODEL_CODE_RE.finditer(consumed):
+        model = m.group(1).strip()
+        if _is_blocked_model_value(model) or _is_generic_header(model):
+            continue
+        canonical = model.upper() if model.lower().startswith("pa-") else model
+        if canonical not in found:
+            found.append(canonical)
+
+    return found
+
+
+def _infer_column_model_map(headers: list, data_rows: list, known_models: list) -> tuple[list, int]:
+    """
+    Find the row that names model columns.
+
+    Returns (col_models, data_start_offset). data_start_offset is 0 when the
+    Markdown header row is the model header, or N when data_rows[N - 1] was
+    promoted to the model header and should be skipped as data.
+    """
+    candidates = [(headers, 0)] + [(row, i + 1) for i, row in enumerate(data_rows[:3])]
+    best_models = []
+    best_offset = 0
+    best_score = 0
+
+    for row, offset in candidates:
+        if len(row) < 2:
+            continue
+        col_models = [_extract_models_from_cell(cell, known_models) for cell in row[1:]]
+        score = sum(len(models) for models in col_models)
+        if score > best_score:
+            best_score = score
+            best_models = col_models
+            best_offset = offset
+
+    return best_models, best_offset
+
+
 def _split_into_segments(text: str) -> list:
     """Split page text into (segment_text, is_table) pairs."""
     parts  = TABLE_BLOCK_RE.split(text)
@@ -166,17 +280,34 @@ def _base_meta(doc_meta: dict, page: int, chunk_idx: int,
                 has_table: bool, chunk_type: str) -> dict:
     """Build the standard metadata dict shared by all chunk types."""
     return {
-        "chunk_type":     chunk_type,
-        "vendor":         doc_meta["vendor"],
-        "product_family": doc_meta.get("product_family", ""),
-        "model":          doc_meta.get("product_family", ""),
-        "category":       doc_meta["category"],
-        "doc_name":       doc_meta["doc_name"],
-        "page":           page,
-        "chunk_idx":      chunk_idx,
-        "has_table":      has_table,
-    }
+        "chunk_type": chunk_type,
 
+        "vendor": doc_meta["vendor"],
+
+        "product_family": doc_meta.get(
+            "product_family",
+            ""
+        ),
+
+        "family": doc_meta.get(
+            "family",
+            doc_meta.get("product_family", "")
+        ),
+
+        "display_family": doc_meta.get(
+            "display_family",
+            ""
+        ),
+
+        "model": "",
+
+        "category": doc_meta["category"],
+        "doc_name": doc_meta["doc_name"],
+        "source_document": doc_meta["doc_name"],
+        "page": page,
+        "chunk_idx": chunk_idx,
+        "has_table": has_table,
+   }
 
 # ── Main chunking ─────────────────────────────────────────────────────────────
 
@@ -199,6 +330,7 @@ def chunk_pages(pages: list, doc_meta: dict) -> list:
     product_family = doc_meta.get("product_family", "")
     category       = doc_meta["category"]
     models         = doc_meta.get("models", [])  # may be empty
+    display_family = doc_meta.get("display_family",doc_meta.get("product_family","UNKNOWN"))
 
     # Context string for spec rows — used as "grounding" text for the LLM
     context_str = (
@@ -254,44 +386,26 @@ def chunk_pages(pages: list, doc_meta: dict) -> list:
 
         # Determine model names from header columns.
         # Convention: col 0 = metric name, col 1..N = model/value columns.
-        col_models = []
-        for h in headers[1:]:
-            h_clean = h.strip()
-            # Try to find matching known model codes in this header cell
-            matched = []
-            for known_model in models:
-                if known_model.lower() in h_clean.lower():
-                    matched.append(known_model)
-            
-            if matched:
-                col_models.append(matched)
-            else:
-                # If PyMuPDF generic header like "Col1", check if row 0 has models
-                if re.match(r"^Col\d+$", h_clean) or not h_clean:
-                    col_models.append([])
-                else:
-                    col_models.append([h_clean])
+        # If PyMuPDF emitted generic headers, promote the first detected model row.
+        col_models, data_start_offset = _infer_column_model_map(headers, data_rows, models)
+        if not any(col_models):
+            logger.debug(
+                f"  [chunker] table page {page_num}: no model columns detected; "
+                "kept table_full only"
+            )
+            continue
 
-        for row_idx, cells in enumerate(data_rows):
+        for row_idx, cells in enumerate(data_rows[data_start_offset:]):
             if not cells:
                 continue
 
-            # If headers were generic, try to use the first row as headers
-            if row_idx == 0 and all(not m for m in col_models):
-                for i, cell in enumerate(cells[1:]):
-                    c_clean = cell.strip()
-                    matched = []
-                    for known_model in models:
-                        if known_model.lower() in c_clean.lower():
-                            matched.append(known_model)
-                    if matched:
-                        col_models[i] = matched
-                    elif c_clean and not re.match(r"^Col\d+$", c_clean):
-                        col_models[i] = [c_clean]
-                continue
-
             metric_raw  = cells[0].strip()
-            if not metric_raw or re.match(r"^[\s\-\:\+]+$", metric_raw) or re.match(r"^Col\d+$", metric_raw):
+            if (
+                not metric_raw
+                or re.match(r"^[\s\-\:\+]+$", metric_raw)
+                or re.match(r"^Col\d+$", metric_raw)
+                or _is_generic_header(metric_raw)
+            ):
                 continue
 
             metric_name = _clean_metric_name(metric_raw)
@@ -307,6 +421,8 @@ def chunk_pages(pages: list, doc_meta: dict) -> list:
                 val     = _clean_cell_value(val_raw)
 
                 if _is_blank_value(val):
+                    continue
+                if _is_generic_header(val):
                     continue
 
                 for col_model in col_model_list:
@@ -327,6 +443,8 @@ def chunk_pages(pages: list, doc_meta: dict) -> list:
                         "model":    col_model,
                         "metric":   metric_name,
                         "value":    val,
+                        "spec_name": metric_name,
+                        "spec_value": val,
                         "chunk_id": chunk_id,
                     })
                     final_chunks.append({"text": chunk_text, "metadata": meta})

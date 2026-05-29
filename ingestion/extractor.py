@@ -23,7 +23,7 @@ def _get_ocr():
     if _paddle_ocr is None:
         try:
             from paddleocr import PaddleOCR
-            _paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+            _paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en")
             logger.info("  [OCR] PaddleOCR loaded.")
         except ImportError:
             logger.warning("  [OCR] PaddleOCR not installed — image pages will be skipped.")
@@ -88,7 +88,64 @@ def _ocr_page(page: fitz.Page) -> str:
         logger.warning(f"  [OCR] Failed: {e}")
         return ""
 
+def _extract_logo_region(page: fitz.Page) -> str:
 
+    ocr = _get_ocr()
+
+    if ocr == "unavailable":
+        return ""
+
+    import numpy as np
+
+    rect = page.rect
+
+    logo_rect = fitz.Rect(
+        0,
+        0,
+        rect.width,
+        rect.height * 0.30
+    )
+
+    mat = fitz.Matrix(
+        OCR_DPI / 72,
+        OCR_DPI / 72
+    )
+
+    pix = page.get_pixmap(
+        matrix=mat,
+        clip=logo_rect,
+        colorspace=fitz.csRGB
+    )
+
+    img = np.frombuffer(
+        pix.samples,
+        dtype=np.uint8
+    ).reshape(
+        pix.h,
+        pix.w,
+        3
+    )
+
+    try:
+
+        results = ocr.ocr(
+            img,
+            cls=True
+        )
+
+        if not results or not results[0]:
+            return ""
+
+        return " ".join(
+            line[1][0]
+            for line in results[0]
+            if line[1][1] > 0.6
+        )
+
+    except Exception:
+
+        return ""
+    
 def extract_pages(pdf_path: str) -> list[dict]:
     """
     Extract all pages. Returns list of:
@@ -98,8 +155,10 @@ def extract_pages(pdf_path: str) -> list[dict]:
     pages_out = []
 
     for page_num, page in enumerate(doc):
-        pd = {"page": page_num + 1, "text": "", "has_tables": False, "ocr_used": False}
-
+        pd = {"page": page_num + 1, "text": "", "has_tables": False, "ocr_used": False, "logo_text": ""}
+        if page_num == 0:
+            pd["logo_text"] = _extract_logo_region(page)
+            
         # Tables first
         tables     = _extract_tables_as_markdown(page)
         t_regions  = [_bbox_to_rect(t["bbox"]) for t in tables]
