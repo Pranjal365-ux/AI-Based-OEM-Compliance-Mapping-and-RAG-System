@@ -1,0 +1,57 @@
+{
+  "run_id": "746fcf78",
+  "started_at": "2026-06-01T11:38:57.363344Z",
+  "completed_at": "2026-06-01T11:47:14.430631Z",
+  "total_files": 4,
+  "successful": 4,
+  "failed": 0,
+  "skipped": 0,
+  "total_models_extracted": 7,
+  "total_chunks_created": 139,
+  "file_results": [
+    {
+      "file_path": "data\\raw\\firewall-features-overview.pdf",
+      "doc_id": "52ddfdeaba7c9055",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 1,
+      "chunks_created": 97,
+      "processing_time_seconds": 100.25,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\fortigate-7000f-series.pdf",
+      "doc_id": "8ce8badd49c9fb3d",
+      "status": "completed",
+      "vendor": "Fortinet",
+      "models_found": 2,
+      "chunks_created": 7,
+      "processing_time_seconds": 105.02,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\opentext-siem-open-data-platform-ds-en.pdf",
+      "doc_id": "3ad5d89735767206",
+      "status": "completed",
+      "vendor": "OpenText",
+      "models_found": 1,
+      "chunks_created": 10,
+      "processing_time_seconds": 153.99,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\pa-3200-series.pdf",
+      "doc_id": "bf0c66afec5eba38",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 3,
+      "chunks_created": 25,
+      "processing_time_seconds": 137.76,
+      "warnings": [],
+      "error_message": ""
+    }
+  ]
+}

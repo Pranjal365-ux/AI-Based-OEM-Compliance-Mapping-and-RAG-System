@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -69,7 +70,7 @@ class OEMIngestionPipeline:
             format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
         )
         logger.add(
-            lambda msg: print(msg, end=""),
+            _safe_console_log,
             level=self.cfg.log_level,
             colorize=True,
             format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
@@ -135,12 +136,16 @@ class OEMIngestionPipeline:
             return result
 
         # ── Skip if already ingested ──────────────────────────────────────────
+        doc_exists = self.vector_store.document_exists(doc_id)
         if self.cfg.skip_existing and not force_reingest:
-            if self.vector_store.document_exists(doc_id):
+            if doc_exists:
                 logger.info(f"Skipping {file_path.name} (already in store)")
                 result.status = IngestionStatus.SKIPPED
                 result.processing_time_seconds = time.time() - start_time
                 return result
+        elif force_reingest and doc_exists:
+            deleted = self.vector_store.delete_document(doc_id)
+            logger.info(f"Force re-ingest: deleted {deleted} existing chunks for {file_path.name}")
 
         logger.info(f"Processing: {file_path.name}")
 
@@ -345,14 +350,29 @@ class OEMIngestionPipeline:
 
 # ─── Helper Functions ────────────────────────────────────────────────────────────
 
+def _safe_console_log(message: object) -> None:
+    text = str(message)
+    try:
+        print(text, end="")
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
+        sys.stdout.flush()
+
+
 def _guess_vendor_from_filename(stem: str) -> Optional[str]:
     """Try to guess vendor from filename like 'fortinet_FG200F_datasheet'."""
-    known = ["fortinet", "cisco", "juniper", "paloalto", "checkpoint",
+    known = ["fortinet", "opentext", "open-text", "cisco", "juniper",
+             "paloalto", "palo-alto", "checkpoint",
              "sonicwall", "sophos", "aruba", "netgear", "hp", "dell", "ibm"]
     stem_lower = stem.lower()
     for vendor in known:
         if vendor in stem_lower:
-            return vendor.title()
+            return {
+                "opentext": "OpenText",
+                "open-text": "OpenText",
+                "paloalto": "Palo Alto Networks",
+                "palo-alto": "Palo Alto Networks",
+            }.get(vendor, vendor.title())
     return None
 
 
@@ -371,6 +391,8 @@ def _attach_tables_to_models(
 
     if len(models) == 1:
         for t in raw_tables:
+            if not _table_has_useful_content(t):
+                continue
             models[0].spec_tables.append(
                 ExtractedTable(
                     page_number=t.get("page_number", 0),
@@ -384,16 +406,19 @@ def _attach_tables_to_models(
 
     # Multiple models: split comparison tables before falling back to text match.
     for t in raw_tables:
+        if not _table_has_useful_content(t):
+            continue
+
         detected = _detect_model_columns(t, models)
         if detected:
             model_column_map, header_row_index = detected
             _split_comparison_table(t, model_column_map, header_row_index, models)
             continue
 
-        table_text = t.get("raw_text", "").upper()
+        table_text = _table_search_text(t)
         matched = False
         for model in models:
-            if model.model_name.upper() in table_text:
+            if _cell_matches_model(table_text, model.model_name):
                 model.spec_tables.append(
                     ExtractedTable(
                         page_number=t.get("page_number", 0),
@@ -405,16 +430,10 @@ def _attach_tables_to_models(
                 )
                 matched = True
                 break
-        # If table doesn't match any model, attach to first model
-        if not matched and models:
-            models[0].spec_tables.append(
-                ExtractedTable(
-                    page_number=t.get("page_number", 0),
-                    table_index=t.get("table_index", 0),
-                    headers=t.get("headers", []),
-                    rows=t.get("rows", []),
-                    raw_text=t.get("raw_text", ""),
-                )
+        if not matched:
+            logger.debug(
+                f"Skipping table {t.get('table_index', 0)} on page "
+                f"{t.get('page_number', 0)}: no model match"
             )
 
 
@@ -546,6 +565,23 @@ def _normalize_spec_key(label: str) -> str:
 
 def _clean_cell(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _table_has_useful_content(table: dict) -> bool:
+    cells = []
+    cells.extend(table.get("headers") or [])
+    cells.extend(cell for row in table.get("rows") or [] for cell in row)
+    cells.append(table.get("raw_text", ""))
+    text = " ".join(_clean_cell(cell) for cell in cells).strip()
+    return len(text) >= 3
+
+
+def _table_search_text(table: dict) -> str:
+    parts = []
+    parts.extend(table.get("headers") or [])
+    parts.extend(cell for row in table.get("rows") or [] for cell in row)
+    parts.append(table.get("raw_text", ""))
+    return " ".join(_clean_cell(part) for part in parts)
 
 
 def _save_intermediate(doc: DatasheetDocument, cfg: PipelineConfig) -> None:

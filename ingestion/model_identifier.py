@@ -125,6 +125,10 @@ def _is_false_positive_model(token: str) -> bool:
     }
     if token in false_positives:
         return True
+    if re.fullmatch(r"SHA[-_]?\d+", token):
+        return True
+    if re.fullmatch(r"NAT\d+", token):
+        return True
     if len(token) <= 2:
         return True
     return False
@@ -144,9 +148,31 @@ def extract_models_from_tables(
 
     for page_table in page_tables:
         headers = [h.lower() for h in page_table.get("headers", [])]
+        raw_headers = page_table.get("headers", [])
         rows = page_table.get("rows", [])
 
-        if not headers or not rows:
+        if not headers:
+            continue
+
+        header_models = _extract_model_names_from_cells(raw_headers, cfg)
+        if header_models:
+            for model_name in header_models:
+                model_entries.append({
+                    "model_name": model_name,
+                    "spec_row": {},
+                })
+            continue
+
+        if not rows:
+            continue
+
+        first_row_models = _extract_model_names_from_cells(rows[0], cfg)
+        if len(first_row_models) >= 2:
+            for model_name in first_row_models:
+                model_entries.append({
+                    "model_name": model_name,
+                    "spec_row": {},
+                })
             continue
 
         # Check if any header looks like a model/part identifier
@@ -172,7 +198,7 @@ def extract_models_from_tables(
             if not row or model_col_idx >= len(row):
                 continue
             model_num = row[model_col_idx].strip()
-            if not model_num or len(model_num) < 3:
+            if not _looks_like_model_number(model_num, cfg):
                 continue
 
             entry = {
@@ -186,6 +212,42 @@ def extract_models_from_tables(
             model_entries.append(entry)
 
     return model_entries
+
+
+def _extract_model_names_from_cells(
+    cells: List[str],
+    cfg: ModelIdentificationConfig,
+) -> List[str]:
+    """Extract model identifiers from header cells in comparison tables."""
+    model_names: List[str] = []
+    seen = set()
+    patterns = _compile_model_patterns(cfg)
+
+    for cell in cells:
+        for line_part in re.split(r"[/,\n]+", str(cell or "")):
+            candidate = line_part.strip().upper().rstrip("*†‡§#|")
+            if not candidate:
+                continue
+            if not any(pattern.fullmatch(candidate) for pattern in patterns):
+                continue
+            if _is_false_positive_model(candidate):
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                model_names.append(candidate)
+
+    return model_names
+
+
+def _looks_like_model_number(value: str, cfg: ModelIdentificationConfig) -> bool:
+    candidate = value.strip().upper().rstrip("*†‡§#|")
+    if not candidate or len(candidate) < 3:
+        return False
+    if len(candidate.split()) > 2:
+        return False
+    if _is_false_positive_model(candidate):
+        return False
+    return any(pattern.fullmatch(candidate) for pattern in _compile_model_patterns(cfg))
 
 
 def _rows_look_like_specs(
@@ -238,46 +300,96 @@ def identify_models_with_llm(
             table_lines.append(f"Table headers: {hdrs}")
         table_summary = "\nTable summaries:\n" + "\n".join(table_lines)
 
-    prompt = f"""You are analyzing an OEM technical datasheet for a cybersecurity product from vendor: {vendor}.
+    prompt = f"""
+You are an OEM cybersecurity datasheet extraction engine.
 
-Your task is to identify ALL distinct product models described in this datasheet and extract their key technical specifications.
-
-Document excerpt:
----
-{sample_text}
-{table_summary}
----
+TASK:
+Identify all distinct product models described in the datasheet.
 
 IMPORTANT:
 Return ONLY valid JSON.
-Do not explain.
-Do not use markdown.
-Do not use code fences.
-Do not use <think> tags.
-Output must begin with '[' and end with ']'.
-Each element should represent one distinct product model:
-{{
-  "model_name": "<part number / model number>",
-  "product_family": "<series / family name if applicable>",
-  "product_category": "<e.g. Next-Generation Firewall, Switch, Access Point>",
-  "description": "<1-2 sentence product description>",
-  "key_specs": {{
-    "<spec_name>": "<value with unit>"
+No explanations.
+No reasoning.
+No analysis.
+No markdown.
+No code fences.
+No comments.
+No <think> tags.
+No text before JSON.
+No text after JSON.
+
+DOCUMENT:
+---
+{sample_text}
+
+{table_summary}
+---
+
+OUTPUT SCHEMA:
+
+[
+  {{
+    "model_name": "<exact model number>",
+    "product_family": "<series or family name>"
+  }}
+]
+
+EXTRACTION RULES:
+
+1. Extract EVERY distinct product model.
+2. Preserve model names exactly as written.
+3. Treat variants as separate models:
+   - FG-7081F
+   - FG-7081F-DC
+   - FG-7081F-2
+   - FG-7081F-2-DC
+
+   are FOUR separate models.
+
+4. Do NOT merge models.
+5. Do NOT infer missing models.
+6. Do NOT generate descriptions.
+7. Do NOT generate features.
+8. Do NOT generate specifications.
+9. Do NOT generate product categories.
+10. If only one model exists, return a single-element array.
+11. If no model exists, return [].
+
+MODEL IDENTIFICATION PRIORITY:
+
+Highest priority:
+- Product comparison tables
+- Ordering information tables
+- Hardware model lists
+- SKU lists
+
+Lower priority:
+- Marketing text
+- Feature descriptions
+- Use cases
+
+VALID EXAMPLE:
+
+[
+  {{
+    "model_name": "PA-3220",
+    "product_family": "PA-3200 Series"
   }},
-  "features": ["<feature1>", "<feature2>"]
-}}
+  {{
+    "model_name": "PA-3250",
+    "product_family": "PA-3200 Series"
+  }},
+  {{
+    "model_name": "PA-3260",
+    "product_family": "PA-3200 Series"
+  }}
+]
 
-Rules:
-- Include EVERY distinct model number you find (e.g. FortiGate 200F and 400F are separate)
-- If there is only one model, return a single-element array
-- Use empty arrays/objects for unknown fields, never null
-- model_name must be the exact part number as written in the document
-- key_specs should include throughput, interfaces, capacity, dimensions, power – whatever is present
+JSON ONLY.
 """
-
     try:
         response = client.chat.completions.create(
-        model=cfg.groq_model,messages=[{"role": "user","content": prompt}],temperature=0,max_completion_tokens=2000)
+        model=cfg.groq_model,messages=[{"role": "user","content": prompt}],temperature=0,max_completion_tokens=3000)
         raw = response.choices[0].message.content.strip()
         # Remove Qwen thinking blocks
         raw = re.sub(
@@ -296,6 +408,9 @@ Rules:
         return models_data
     except json.JSONDecodeError as e:
         logger.warning(f"LLM returned non-JSON response: {e}")
+        print("\n===== RAW LLM RESPONSE =====")
+        print(response)
+        print("===========================\n")
         return []
     except Exception as e:
         logger.warning(f"LLM model identification failed: {e}")
@@ -344,7 +459,7 @@ def identify_models(
                     identified_by="llm",
                 )
                 models.append(spec)
-            return _deduplicate_models(models)
+            return models
 
     # ── Strategy 2: Table-based ────────────────────────────────────────────────
     table_models = extract_models_from_tables(all_tables, cfg.model_id)
@@ -370,7 +485,7 @@ def identify_models(
         if models:
             # Enrich with surrounding text
             _enrich_models_with_sections(models, sections, full_text)
-            return _deduplicate_models(models)
+            return models
 
     # ── Strategy 3: Regex pattern matching ────────────────────────────────────
     candidates = extract_candidate_model_numbers(full_text, cfg.model_id)
@@ -386,7 +501,7 @@ def identify_models(
             )
             models.append(spec)
         _enrich_models_with_sections(models, sections, full_text)
-        return _deduplicate_models(models)
+        return models
 
     # ── Strategy 4: Single model fallback ─────────────────────────────────────
     logger.info("No distinct models identified – treating as single-model document")
@@ -480,13 +595,3 @@ def _enrich_models_with_sections(
             model.spec_sections["context"] = "\n".join(matches[:5])
 
 
-def _deduplicate_models(models: List[ModelSpec]) -> List[ModelSpec]:
-    """Remove duplicate model entries (same model_name)."""
-    seen: set = set()
-    unique = []
-    for m in models:
-        key = m.model_name.upper().strip()
-        if key not in seen:
-            seen.add(key)
-            unique.append(m)
-    return unique

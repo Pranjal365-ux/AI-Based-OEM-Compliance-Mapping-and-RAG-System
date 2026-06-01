@@ -3,7 +3,7 @@ OEM Datasheet Ingestion Pipeline - Data Models
 Pydantic schemas for typed, validated data throughout the pipeline.
 """
 from __future__ import annotations
-
+from datetime import datetime, timezone 
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -82,6 +82,16 @@ class ExtractedTable(BaseModel):
         parts = []
         if self.headers and self.rows:
             for row in self.rows:
+                if (
+                    len(self.headers) == 2
+                    and len(row) >= 2
+                    and self.headers[0].strip().lower() in {"parameter", "specification", "spec", "feature", "name"}
+                    and self.headers[1].strip().lower() in {"value", "description", "setting"}
+                    and row[0].strip()
+                    and row[1].strip()
+                ):
+                    parts.append(f"{row[0].strip()}: {row[1].strip()}")
+                    continue
                 for h, v in zip(self.headers, row):
                     if h.strip() and v.strip():
                         parts.append(f"{h.strip()}: {v.strip()}")
@@ -150,7 +160,7 @@ class DatasheetDocument(BaseModel):
     extraction_method: ExtractionMethod = ExtractionMethod.PDFPLUMBER
 
     # Audit
-    processed_at: datetime = Field(default_factory=datetime.utcnow)
+    processed_at: datetime = Field(default_factory=lambda:datetime.now(timezone.utc))
     pipeline_version: str = "1.0.0"
     warnings: List[str] = []
     errors: List[str] = []
@@ -188,7 +198,6 @@ class DocumentChunk(BaseModel):
     extraction_method: str = ""
     pipeline_version: str = "1.0.0"
     created_at: str = ""
-
     def to_chroma_metadata(self) -> Dict[str, Any]:
         """Flatten for ChromaDB (no nested objects, lists as comma-sep strings)."""
         return {
@@ -211,7 +220,7 @@ class DocumentChunk(BaseModel):
         }
 
 
-# ─── Pipeline Run Models ────────────────────────────────────────────────────────
+# ─── Pipeline Run Modelsu ────────────────────────────────────────────────────────
 
 class FileIngestionResult(BaseModel):
     file_path: str
@@ -227,7 +236,7 @@ class FileIngestionResult(BaseModel):
 
 class PipelineRunResult(BaseModel):
     run_id: str
-    started_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: datetime = Field(default_factory=lambda:datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
     total_files: int = 0
     successful: int = 0

@@ -177,12 +177,43 @@ class TestModelIdentification:
         unique = _deduplicate_models(models)
         assert len(unique) == 2
 
+    def test_fortinet_variants_and_modules_are_not_primary_models(self, config):
+        from ingestion.model_identifier import _deduplicate_models
+        from models.schemas import ModelSpec
+
+        models = [
+            ModelSpec(model_id="a", model_name="FG-7081F", vendor="Fortinet"),
+            ModelSpec(model_id="b", model_name="FG-7081F-DC", vendor="Fortinet"),
+            ModelSpec(model_id="c", model_name="FG-7081F-2", vendor="Fortinet"),
+            ModelSpec(model_id="d", model_name="FG-7121F", vendor="Fortinet"),
+            ModelSpec(model_id="e", model_name="FIM-7921F", vendor="Fortinet"),
+            ModelSpec(model_id="f", model_name="FPM-7620F", vendor="Fortinet"),
+        ]
+
+        unique = _deduplicate_models(models)
+        assert [m.model_name for m in unique] == ["FG-7081F", "FG-7121F"]
+
     def test_false_positive_filter(self):
         from ingestion.model_identifier import _is_false_positive_model
         assert _is_false_positive_model("IEEE")
         assert _is_false_positive_model("SSL")
         assert _is_false_positive_model("HTTP")
         assert not _is_false_positive_model("FG-200F")
+
+    def test_comparison_table_headers_are_models_not_spec_rows(self, config):
+        from ingestion.model_identifier import extract_models_from_tables
+
+        tables = [{
+            "headers": ["Table 1: PA-3200 Series Performance and Capacities", "", "", ""],
+            "rows": [
+                ["", "PA-3220", "PA-3250", "PA-3260"],
+                ["Firewall throughput", "4 Gbps", "5 Gbps", "7.5 Gbps"],
+                ["Threat Prevention throughput", "2.2 Gbps", "2.5 Gbps", "4 Gbps"],
+            ],
+        }]
+
+        models = extract_models_from_tables(tables, config.model_id)
+        assert [m["model_name"] for m in models] == ["PA-3220", "PA-3250", "PA-3260"]
 
 
 # ─── Chunking Tests ───────────────────────────────────────────────────────────────
@@ -374,6 +405,19 @@ class TestVendorDetection:
         name, conf = _parse_vendor_from_text("Acme Corp\nProduct Specifications")
         assert name  # Should return something
         assert 0.0 <= conf <= 1.0
+
+    def test_opentext_not_misidentified_as_intel(self):
+        from ingestion.pdf_extractor import _parse_vendor_from_text
+
+        text = (
+            "DATA SHEET\n"
+            "opentext\n"
+            "OpenText SIEM Open Data Platform\n"
+            "Security intelligence and event management"
+        )
+        name, conf = _parse_vendor_from_text(text)
+        assert name == "OpenText"
+        assert conf >= 0.8
 
     def test_empty_text(self):
         from ingestion.pdf_extractor import _parse_vendor_from_text

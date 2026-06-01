@@ -28,6 +28,12 @@ import os
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass
+
 
 # ─── Path setup ─────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))

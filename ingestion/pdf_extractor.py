@@ -223,8 +223,8 @@ def _parse_vendor_from_text(header_text: str) -> Tuple[str, float]:
     if not lines:
         return "Unknown", 0.0
 
-    # Known vendor name patterns (can be extended)
     known_vendors = {
+        # Network & Security
         "fortinet": "Fortinet",
         "cisco": "Cisco",
         "palo alto": "Palo Alto Networks",
@@ -237,29 +237,149 @@ def _parse_vendor_from_text(header_text: str) -> Tuple[str, float]:
         "sophos": "Sophos",
         "barracuda": "Barracuda Networks",
         "watchguard": "WatchGuard",
-        "netgear": "Netgear",
+        "f5": "F5",
+        "f5 networks": "F5",
+        "radware": "Radware",
+        "netscout": "NETSCOUT",
+        "netskope": "Netskope",
+        "zscaler": "Zscaler",
+        "forescout": "Forescout",
+        "arista": "Arista Networks",
+        "extreme": "Extreme Networks",
+        "extreme networks": "Extreme Networks",
         "ubiquiti": "Ubiquiti",
+        "netgear": "Netgear",
         "aruba": "Aruba Networks",
+
+        # Endpoint / Email / Security
+        "trendmicro": "Trend Micro",
+        "trend micro": "Trend Micro",
+        "trellix": "Trellix",
+        "mcafee": "Trellix",
+        "ivanti": "Ivanti",
+        "cyberark": "CyberArk",
+        "opswat": "OPSWAT",
+        "sysdig": "Sysdig",
+
+        # Threat Intelligence / ASM
+        "cyble": "Cyble",
+        "cloudsek": "CloudSEK",
+        "recorded future": "Recorded Future",
+        "crowdstrike": "CrowdStrike",
+        "microsoft defender": "Microsoft",
+        "sentinelone": "SentinelOne",
+        "rapid7": "Rapid7",
+        "tenable": "Tenable",
+        "qualys": "Qualys",
+        "varonis": "Varonis",
+
+        # PKI / Encryption / HSM
+        "emudhra": "eMudhra",
+        "e mudhra": "eMudhra",
+        "utimaco": "Utimaco",
+        "thales": "Thales",
+        "entrust": "Entrust",
+
+        # PAM / Identity
+        "arcon": "ARCON",
+        "okta": "Okta",
+        "ping identity": "Ping Identity",
+        "forgerock": "ForgeRock",
+        "sailpoint": "SailPoint",
+
+        # DLP / Data Security
+        "forcepoint": "Forcepoint",
+        "symantec": "Broadcom",
+        "broadcom": "Broadcom",
+        "digital guardian": "Digital Guardian",
+        "proofpoint": "Proofpoint",
+
+        # Data Governance / Discovery
+        "data resolve": "Data Resolve",
+        "dataresolve": "Data Resolve",
+
+        # Cloud Security
+        "wiz": "Wiz",
+        "prisma cloud": "Palo Alto Networks",
+        "lacework": "Lacework",
+        "orca security": "Orca Security",
+
+        # SIEM / Observability / Analytics
+        "elastic": "Elastic",
+        "elk": "Elastic",
+        "splunk": "Splunk",
+        "sumologic": "Sumo Logic",
+        "datadog": "Datadog",
+        "dynatrace": "Dynatrace",
+        "new relic": "New Relic",
+        "grafana": "Grafana Labs",
+        "opentext": "OpenText",
+        "open text": "OpenText",
+
+        # CDN / WAF / DNS
+        "cloudflare": "Cloudflare",
+        "cloud flare": "Cloudflare",
+        "akamai": "Akamai",
+        "imperva": "Imperva",
+
+        # Infrastructure / Compute
         "hp ": "HP",
         "hewlett packard": "HP",
+        "hpe": "HPE",
+        "hewlett packard enterprise": "HPE",
         "dell": "Dell Technologies",
         "lenovo": "Lenovo",
         "ibm": "IBM",
         "intel": "Intel",
         "amd": "AMD",
         "nvidia": "NVIDIA",
+        "oracle": "Oracle",
+
+        # Storage / Hyperconverged
+        "hitachi": "Hitachi Vantara",
+        "hitachi vantara": "Hitachi Vantara",
+        "netapp": "NetApp",
+        "nutanix": "Nutanix",
+        "pure storage": "Pure Storage",
+        "emc": "Dell EMC",
+        "dell emc": "Dell EMC",
+
+        # Virtualization
+        "vmware": "VMware",
+        "citrix": "Citrix",
+        "red hat": "Red Hat",
+
+        # Physical Security
         "axis": "Axis Communications",
         "hikvision": "Hikvision",
         "dahua": "Dahua Technology",
         "bosch": "Bosch Security",
         "honeywell": "Honeywell",
+
+        # Industrial / OT
         "schneider": "Schneider Electric",
         "siemens": "Siemens",
+        "rockwell": "Rockwell Automation",
+        "abb": "ABB",
+
+        # Backup & Recovery
+        "veeam": "Veeam",
+        "commvault": "Commvault",
+        "rubrik": "Rubrik",
+        "cohesity": "Cohesity",
+
+        # Public Cloud
+        "aws": "Amazon Web Services",
+        "amazon web services": "Amazon Web Services",
+        "azure": "Microsoft Azure",
+        "microsoft azure": "Microsoft Azure",
+        "gcp": "Google Cloud",
+        "google cloud": "Google Cloud",
     }
 
     text_lower = header_text.lower()
-    for key, name in known_vendors.items():
-        if key in text_lower:
+    for key, name in sorted(known_vendors.items(), key=lambda item: -len(item[0])):
+        if _vendor_key_in_text(key, text_lower):
             return name, 0.9
 
     # Fallback: take first line that looks like a company name
@@ -279,6 +399,17 @@ def _parse_vendor_from_text(header_text: str) -> Tuple[str, float]:
             return clean[:50].title(), 0.3
 
     return "Unknown", 0.1
+
+
+def _vendor_key_in_text(key: str, text_lower: str) -> bool:
+    """Match vendor names as terms, so 'intel' does not match 'intelligence'."""
+    key = key.strip().lower()
+    if not key:
+        return False
+    pattern = r"(?<![a-z0-9])" + r"\s+".join(
+        re.escape(part) for part in key.split()
+    ) + r"(?![a-z0-9])"
+    return re.search(pattern, text_lower) is not None
 
 
 # ─── Full Document Text Extraction ─────────────────────────────────────────────
@@ -379,6 +510,8 @@ class PageExtractor:
                 continue
             # Treat first row as header if it looks like one
             rows = [[str(c or "").strip() for c in row] for row in table]
+            if not _table_has_useful_text(rows):
+                continue
             headers: List[str] = []
             data_rows = rows
 
@@ -389,8 +522,9 @@ class PageExtractor:
                     headers = first_row
                     data_rows = rows[1:]
 
+            flat_rows = rows if not headers else [headers] + data_rows
             flat_text = "\n".join(
-                " | ".join(r) for r in (rows if not headers else data_rows)
+                " | ".join(r) for r in flat_rows if any(c.strip() for c in r)
             )
             parsed.append({
                 "page_number": page_number,
@@ -400,6 +534,14 @@ class PageExtractor:
                 "raw_text": flat_text,
             })
         return parsed
+
+
+def _table_has_useful_text(rows: List[List[str]]) -> bool:
+    text_cells = [cell for row in rows for cell in row if cell.strip()]
+    if not text_cells:
+        return False
+    text = " ".join(text_cells)
+    return len(text) >= 3
 
 
 # ─── Document-Level Extraction ──────────────────────────────────────────────────
