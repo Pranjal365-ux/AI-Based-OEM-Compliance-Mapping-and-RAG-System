@@ -19,7 +19,18 @@ LOGS_DIR = BASE_DIR / "logs"
 for d in [RAW_DIR, PROCESSED_DIR, VECTOR_STORE_DIR, LOGS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
+@dataclass
+class LLMConfig:
+    provider: str = "groq"
 
+    model: str = "qwen/qwen3-32b"
+
+    api_key: str = field(
+        default_factory=lambda: os.getenv(
+            "GROQ_API_KEY",
+            ""
+        )
+    )
 @dataclass
 class OCRConfig:
     """Tesseract OCR settings."""
@@ -120,7 +131,7 @@ class PipelineConfig:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     vector_store: VectorStoreConfig = field(default_factory=VectorStoreConfig)
     model_id: ModelIdentificationConfig = field(default_factory=ModelIdentificationConfig)
-
+    llm: LLMConfig = field(default_factory=LLMConfig)
     # Processing behaviour
     skip_existing: bool = True          # Skip PDFs already in vector DB
     save_intermediate: bool = True      # Save extracted JSON to PROCESSED_DIR

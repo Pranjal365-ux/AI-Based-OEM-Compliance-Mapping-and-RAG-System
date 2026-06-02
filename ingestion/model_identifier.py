@@ -13,7 +13,7 @@ from loguru import logger
 
 from config.settings import ModelIdentificationConfig, PipelineConfig
 from models.schemas import ExtractedTable, ModelSpec
-
+from ingestion.classifier import detect_category
 
 # ─── Pattern Compilation ────────────────────────────────────────────────────────
 
@@ -281,9 +281,7 @@ def identify_models_with_llm(
         logger.info("No Groq API key – skipping LLM model identification")
         return []
     try:
-        from groq import Groq
-
-        client = Groq(api_key=cfg.groq_api_key)
+        from services.llm_services import llm
     except Exception as e:
         logger.warning(f"Failed to init Groq client: {e}")
         return []
@@ -388,9 +386,11 @@ VALID EXAMPLE:
 JSON ONLY.
 """
     try:
-        response = client.chat.completions.create(
-        model=cfg.groq_model,messages=[{"role": "user","content": prompt}],temperature=0,max_completion_tokens=3000)
-        raw = response.choices[0].message.content.strip()
+        raw = llm.generate(
+            prompt,
+            temperature=0,
+            max_tokens=3000,
+        )
         # Remove Qwen thinking blocks
         raw = re.sub(
             r"<think>.*?</think>",
@@ -422,8 +422,10 @@ JSON ONLY.
 def identify_models(
     pages: List[dict],
     vendor: str,
+    filename: str,
     cfg: PipelineConfig,
 ) -> List[ModelSpec]:
+        
     """
     Master function: identify all models in a parsed document.
 
@@ -435,8 +437,12 @@ def identify_models(
     """
     full_text = "\n".join(p.get("cleaned_text", "") for p in pages)
     all_tables = [t for p in pages for t in p.get("tables", [])]
+    
     sections = split_into_sections(pages)
-
+    category, confidence = detect_category(
+                filename=filename,
+                full_text=full_text,
+        )
     models: List[ModelSpec] = []
 
     # ── Strategy 1: LLM ────────────────────────────────────────────────────────
@@ -450,7 +456,8 @@ def identify_models(
                     model_name=model_name,
                     vendor=vendor,
                     product_family=m.get("product_family"),
-                    product_category=m.get("product_category"),
+                    product_category=category,
+                    category_confidence=confidence,
                     description=m.get("description", ""),
                     spec_sections=_flatten_key_specs(m.get("key_specs", {})),
                     features=m.get("features", []),
@@ -478,6 +485,8 @@ def identify_models(
                 spec_sections={"specifications": spec_text} if spec_text else {},
                 source_pages=list(range(1, len(pages) + 1)),
                 extraction_confidence=0.75,
+                product_category=category,
+                category_confidence=confidence,
                 identified_by="table",
             )
             models.append(spec)
@@ -497,6 +506,8 @@ def identify_models(
                 vendor=vendor,
                 source_pages=list(range(1, len(pages) + 1)),
                 extraction_confidence=0.5,
+                product_category=category,
+                category_confidence=confidence,
                 identified_by="regex",
             )
             models.append(spec)
@@ -516,6 +527,8 @@ def identify_models(
         spec_tables=[],
         source_pages=list(range(1, len(pages) + 1)),
         extraction_confidence=0.4,
+        product_category=category,
+        category_confidence=confidence,
         identified_by="fallback_single",
     )
     return [spec]

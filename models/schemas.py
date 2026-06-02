@@ -126,7 +126,8 @@ class ModelSpec(BaseModel):
     model_name: str                 # Human-readable model name / part number
     vendor: str
     product_family: Optional[str] = None   # e.g. "FortiGate 200F Series"
-    product_category: Optional[str] = None # e.g. "Next-Generation Firewall"
+    product_category: str = "Unkown" # e.g. "Next-Generation Firewall"
+    category_confidence: float = 0.0
     description: str = ""
 
     # Raw spec data (before chunking)
@@ -154,7 +155,8 @@ class DatasheetDocument(BaseModel):
     filename: str
     vendor: VendorInfo
     page_count: int
-
+    product_category: str = "Unknown"
+    category_confidence: float = 0.0
     models: List[ModelSpec] = []         # One or more product models
     global_description: str = ""        # Text that applies to the whole doc
     extraction_method: ExtractionMethod = ExtractionMethod.PDFPLUMBER
@@ -251,3 +253,22 @@ class PipelineRunResult(BaseModel):
         if self.completed_at:
             return (self.completed_at - self.started_at).total_seconds()
         return 0.0
+
+class Requirement(BaseModel):
+    requirement_id: str
+
+    category: str
+
+    requirement: str
+
+    source_text: str
+
+    mandatory: bool = True
+
+    operator: Optional[str] = None
+
+    value: Optional[str] = None
+
+    unit: Optional[str] = None
+
+    section: Optional[str] = None

@@ -199,7 +199,7 @@ class OEMIngestionPipeline:
 
             # ── Step 3: Identify models ───────────────────────────────────────
             logger.info(f"  [3/4] Identifying product models…")
-            models = identify_models(pages, vendor_name, self.cfg)
+            models = identify_models(pages, vendor_name, file_path.name, self.cfg)
             logger.info(f"  → Found {len(models)} model(s)")
             result.models_found = len(models)
 
