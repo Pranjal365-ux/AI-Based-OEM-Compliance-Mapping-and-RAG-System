@@ -303,6 +303,17 @@ def chunk_document(
     if not doc.models:
         logger.warning(f"Document {doc.filename} has no models to chunk")
         return []
+    
+    for model in doc.models:
+        print(
+            model.model_name,
+            "desc=", bool(model.description),
+            "features=", len(model.features),
+            "sections=", len(model.spec_sections),
+            "tables=", len(model.spec_tables),
+            "specs=", len(model.specs),
+            "common_specs=", len(model.common_specs),
+        )    
 
     for model in doc.models:
         model_chunks = chunk_model_spec(model, doc, cfg)

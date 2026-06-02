@@ -466,6 +466,7 @@ def identify_models(
                     identified_by="llm",
                 )
                 models.append(spec)
+                _enrich_models_with_sections(models,sections,full_text)
             return models
 
     # ── Strategy 2: Table-based ────────────────────────────────────────────────
@@ -581,30 +582,36 @@ def _guess_model_name(pages: List[dict], vendor: str) -> str:
                 return line[:80]
     return f"{vendor} Product"
 
-
 def _enrich_models_with_sections(
     models: List[ModelSpec],
     sections: Dict[str, List[str]],
     full_text: str,
 ) -> None:
     """
-    Attach section text to models. When there's one model, all sections apply.
-    When multiple models exist, find model-specific text blocks.
+    Attach section text and description to models.
     """
-    if len(models) == 1:
-        models[0].spec_sections = _sections_to_spec_dict(sections)
-        models[0].description = _extract_description(sections)
+
+    if not models:
         return
 
-    # Multiple models: try to find sections by searching context around model name
+    shared_sections = _sections_to_spec_dict(sections)
+    shared_description = _extract_description(sections)
+
     for model in models:
+
+        model.spec_sections = dict(shared_sections)
+        model.description = shared_description
+
         mn = re.escape(model.model_name)
+
         pattern = re.compile(
-            rf'(?:^|\n)([^\n]{{0,200}}{mn}[^\n]{{0,800}})',
-            re.MULTILINE | re.IGNORECASE
+            rf"(?:^|\n)([^\n]{{0,200}}{mn}[^\n]{{0,1200}})",
+            re.MULTILINE | re.IGNORECASE,
         )
+
         matches = pattern.findall(full_text)
+
         if matches:
-            model.spec_sections["context"] = "\n".join(matches[:5])
+            model.spec_sections["model_context"] = "\n".join(matches[:5])
 
 
