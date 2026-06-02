@@ -230,6 +230,14 @@ class OEMIngestionPipeline:
 
             # ── Save intermediate JSON ────────────────────────────────────────
             if self.cfg.save_intermediate:
+                    print("BEFORE SAVE")
+
+            for model in doc.models:
+                print(
+                    model.model_name,
+                    len(model.spec_sections),
+                    bool(model.description)
+                )
                 _save_intermediate(doc, self.cfg)
 
             # ── Step 4: Chunk & embed ─────────────────────────────────────────
@@ -588,6 +596,7 @@ def _save_intermediate(doc: DatasheetDocument, cfg: PipelineConfig) -> None:
     """Save parsed document as JSON for debugging / audit."""
     from config.settings import PROCESSED_DIR
     out_path = PROCESSED_DIR / f"{doc.doc_id}_{doc.filename}.json"
+    print("SAVING TO:", out_path)
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(doc.model_dump_json(indent=2))

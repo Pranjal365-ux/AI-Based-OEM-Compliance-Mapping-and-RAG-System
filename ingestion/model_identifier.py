@@ -466,7 +466,8 @@ def identify_models(
                     identified_by="llm",
                 )
                 models.append(spec)
-                _enrich_models_with_sections(models,sections,full_text)
+            # ↑ _enrich called ONCE after ALL models are built, not inside loop
+            _enrich_models_with_sections(models, sections, full_text)
             return models
 
     # ── Strategy 2: Table-based ────────────────────────────────────────────────
@@ -581,37 +582,101 @@ def _guess_model_name(pages: List[dict], vendor: str) -> str:
             if 3 <= len(line.split()) <= 8:
                 return line[:80]
     return f"{vendor} Product"
-
 def _enrich_models_with_sections(
     models: List[ModelSpec],
     sections: Dict[str, List[str]],
     full_text: str,
 ) -> None:
     """
-    Attach section text and description to models.
-    """
+    Distribute document sections and text context to each model's spec_sections.
 
-    if not models:
+    Single model  → entire document goes to it.
+    Multi-model   → three-pass strategy:
+        Pass 1: shared sections (apply to ALL models — avoids blank models)
+        Pass 2: per-model context windows (text immediately around model name)
+        Pass 3: common_specs already populated by _split_comparison_table
+                — these flow through to chunker automatically, nothing to do here.
+    """
+    # ── Single model: everything belongs to it ────────────────────────────────
+    if len(models) == 1:
+        models[0].spec_sections = _sections_to_spec_dict(sections)
+        models[0].description = _extract_description(sections)
         return
 
-    shared_sections = _sections_to_spec_dict(sections)
+    # ── Multi-model ───────────────────────────────────────────────────────────
+
+    # Sections that contain specs shared across the whole product family.
+    # These are copied verbatim to every model so each model is self-contained
+    # in the vector DB (an embedder querying "PA-3250 throughput" should find it
+    # even if the value lives in a shared section).
+    SHARED_SECTION_KEYWORDS = {
+        "overview", "introduction", "description", "features", "key features",
+        "certifications", "compliance", "regulatory", "standards",
+        "ordering information", "ordering", "part number",
+        "environmental", "operating conditions", "safety",
+        "warranty", "support",
+    }
+
+    shared_sections: Dict[str, str] = {}
+    spec_sections:   Dict[str, str] = {}  # likely model-specific
+
+    for section_name, lines in sections.items():
+        if section_name == "_preamble":
+            continue
+        text = "\n".join(lines).strip()
+        if not text:
+            continue
+        key = section_name.lower()
+        if any(kw in key for kw in SHARED_SECTION_KEYWORDS):
+            shared_sections[section_name.title()] = text
+        else:
+            spec_sections[section_name.title()] = text
+
+    # Shared description (from preamble / overview)
     shared_description = _extract_description(sections)
 
+    # ── Pass 1: give every model the shared sections + description ────────────
     for model in models:
+        model.description = model.description or shared_description
+        # Seed spec_sections with shared content; per-model content added below
+        for sec_name, sec_text in shared_sections.items():
+            if sec_name not in model.spec_sections:
+                model.spec_sections[sec_name] = sec_text
 
-        model.spec_sections = dict(shared_sections)
-        model.description = shared_description
-
+    # ── Pass 2: per-model context extraction ─────────────────────────────────
+    # For each model, search full_text for paragraphs/lines that contain
+    # the model name (case-insensitive). Collect up to ~4000 chars of
+    # model-specific context and store it as a dedicated section.
+    # Also distribute spec sections whose text references this model.
+    for model in models:
         mn = re.escape(model.model_name)
 
-        pattern = re.compile(
-            rf"(?:^|\n)([^\n]{{0,200}}{mn}[^\n]{{0,1200}})",
-            re.MULTILINE | re.IGNORECASE,
+        # --- 2a. Context window: text immediately surrounding model references ---
+        context_blocks: List[str] = []
+        # Split full text into paragraphs and keep those mentioning the model
+        paragraphs = re.split(r'\n{2,}', full_text)
+        for para in paragraphs:
+            if re.search(mn, para, re.IGNORECASE):
+                block = para.strip()
+                if len(block) > 20:
+                    context_blocks.append(block)
+        if context_blocks:
+            model.spec_sections["Model Context"] = "\n\n".join(context_blocks)[:4000]
+
+        # --- 2b. Distribute general spec sections to every model -------------
+        # Sections like "Technical Specifications" that apply to all models
+        # (they were not classified as shared above) go to every model.
+        # This ensures M2/M3 get performance/connectivity sections too.
+        for sec_name, sec_text in spec_sections.items():
+            if sec_name not in model.spec_sections:
+                model.spec_sections[sec_name] = sec_text
+
+    # ── Pass 3: log summary ────────────────────────────────────────────────────
+    for model in models:
+        logger.debug(
+            f"  Enriched '{model.model_name}': "
+            f"{len(model.spec_sections)} sections, "
+            f"{len(model.specs)} model-specs, "
+            f"{len(model.common_specs)} common-specs, "
+            f"{len(model.features)} features"
         )
-
-        matches = pattern.findall(full_text)
-
-        if matches:
-            model.spec_sections["model_context"] = "\n".join(matches[:5])
-
-
