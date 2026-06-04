@@ -21,16 +21,13 @@ for d in [RAW_DIR, PROCESSED_DIR, VECTOR_STORE_DIR, LOGS_DIR]:
 
 @dataclass
 class LLMConfig:
-    provider: str = "groq"
-
-    model: str = "qwen/qwen3-32b"
-
+    provider: str = "local"
+    model: str = "local-model"  # Set to the model name running on the local server
+    base_url: str = "http://192.168.2.123:11434/v1"  # Defaulting to standard v1 API path (Ollama/LMStudio/vLLM)
     api_key: str = field(
-        default_factory=lambda: os.getenv(
-            "GROQ_API_KEY",
-            ""
-        )
+        default_factory=lambda: os.getenv("LLM_API_KEY", "local")
     )
+
 @dataclass
 class OCRConfig:
     """Tesseract OCR settings."""
@@ -138,10 +135,11 @@ class PipelineConfig:
     parallel_workers: int = 2
     log_level: str = "INFO"
 
-    # GROQ for advanced model identification (optional)
+    # LLM config for advanced model identification
     use_llm_for_model_id: bool = True
-    groq_model: str = "qwen/qwen3-32b"
-    groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", ""))
+    llm_model: str = "local-model"
+    llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", "local"))
+    llm_base_url: str = "http://192.168.2.123:11434/v1"
 
 
 # Singleton config instance
