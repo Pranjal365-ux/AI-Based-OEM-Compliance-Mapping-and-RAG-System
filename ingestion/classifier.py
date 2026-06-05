@@ -439,3 +439,49 @@ def detect_category(filename: str, full_text: str):
 
     logger.info(f"  [classifier] '{filename}' -> {top_cat} (score={top_score:.1f}, conf={confidence:.2f})")
     return top_cat, round(confidence, 3)
+
+
+def propagate_category_from_models(
+    doc_category: str,
+    doc_confidence: float,
+    model_categories: list,
+) -> tuple:
+    """
+    If the document-level category detection failed (Unknown / zero confidence),
+    fall back to the majority category from the per-model entries.
+
+    Parameters
+    ----------
+    doc_category    : category returned by detect_category for the full document
+    doc_confidence  : confidence score returned by detect_category
+    model_categories: list of (category, confidence) tuples from each ModelSpec
+
+    Returns
+    -------
+    (resolved_category, resolved_confidence)
+    """
+    if doc_category != "Unknown" and doc_confidence > 0.0:
+        return doc_category, doc_confidence
+
+    if not model_categories:
+        return doc_category, doc_confidence
+
+    # Tally votes weighted by per-model confidence
+    tally: dict = {}
+    for cat, conf in model_categories:
+        if cat and cat != "Unknown":
+            tally[cat] = tally.get(cat, 0.0) + (conf or 0.5)
+
+    if not tally:
+        return doc_category, doc_confidence
+
+    best_cat = max(tally, key=lambda c: tally[c])
+    # Average confidence across models that voted for the winner
+    winning_confs = [conf for cat, conf in model_categories if cat == best_cat]
+    avg_conf = sum(winning_confs) / len(winning_confs) if winning_confs else 0.5
+
+    logger.info(
+        f"  [classifier] document category resolved via model propagation: "
+        f"{best_cat} (avg_conf={avg_conf:.2f})"
+    )
+    return best_cat, round(avg_conf, 3)

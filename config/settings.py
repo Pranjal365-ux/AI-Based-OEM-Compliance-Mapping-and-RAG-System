@@ -22,7 +22,7 @@ for d in [RAW_DIR, PROCESSED_DIR, VECTOR_STORE_DIR, LOGS_DIR]:
 @dataclass
 class LLMConfig:
     provider: str = "local"
-    model: str = "local-model"  # Set to the model name running on the local server
+    model: str = "qwen3:8b"  # Set to the model name running on the local server
     base_url: str = "http://192.168.2.123:11434/v1"  # Defaulting to standard v1 API path (Ollama/LMStudio/vLLM)
     api_key: str = field(
         default_factory=lambda: os.getenv("LLM_API_KEY", "local")
@@ -56,19 +56,19 @@ class PDFConfig:
 class ChunkingConfig:
     """Text chunking / splitting settings."""
     # Model-level spec chunks
-    spec_chunk_size: int = 400
-    spec_chunk_overlap: int = 80
+    spec_chunk_size: int = 1200
+    spec_chunk_overlap: int = 200
 
     # Table chunks — split large tables into rows/groups
-    table_chunk_size: int = 500
-    table_chunk_overlap: int = 50
+    table_chunk_size: int = 1500
+    table_chunk_overlap: int = 150
 
     # General description chunks
-    general_chunk_size: int = 300
-    general_chunk_overlap: int = 60
+    general_chunk_size: int = 1000
+    general_chunk_overlap: int = 150
 
     # Hard limit: if a single spec block exceeds this, split it
-    max_single_chunk: int = 600
+    max_single_chunk: int = 2000
 
 
 @dataclass
@@ -137,7 +137,7 @@ class PipelineConfig:
 
     # LLM config for advanced model identification
     use_llm_for_model_id: bool = True
-    llm_model: str = "local-model"
+    llm_model: str = "qwen3:8b"
     llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", "local"))
     llm_base_url: str = "http://192.168.2.123:11434/v1"
 

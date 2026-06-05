@@ -41,29 +41,12 @@ from services.llm_services import llm
 logger = logging.getLogger(__name__)
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-CHUNK_SIZE        = 4_000   # chars per LLM extraction call
+CHUNK_SIZE        = 3_000   # chars per LLM extraction call
 MAX_WORKERS       = 8       # parallel extraction threads
-DISCOVERY_PAGE_CHAR_BUDGET = 600
-DISCOVERY_DIGEST_CHAR_BUDGET = 20_000
+DISCOVERY_PAGE_CHAR_BUDGET = 420
+DISCOVERY_DIGEST_CHAR_BUDGET = 12_000
 DISCOVERY_PAGE_BATCH_SIZE = 4
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Words that indicate a heading is a requirement sub-section, NOT a product
-_SUBSECTION_INDICATORS = frozenset({
-    "requirement", "requirements", "specification", "specifications",
-    "performance", "capacity", "feature", "features", "general",
-    "overview", "introduction", "scope", "objective", "objectives",
-    "compliance", "evaluation", "criteria", "scoring",
-    "technical", "functional", "non-functional", "operational",
-    "management", "monitoring", "logging", "reporting",
-    "high availability", "redundancy", "scalability",
-    "integration", "deployment", "installation", "configuration",
-    "support", "maintenance", "warranty", "training",
-    "security", "authentication", "authorization", "encryption",
-    "licensing", "pricing", "commercial", "contractual", "legal",
-    "sla", "deliverables", "timelines", "milestones",
-    "architecture", "design", "topology", "diagram",
-})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -205,7 +188,6 @@ class RFPRequirementExtractor:
            context excerpts.
         2. One LLM call on that outline  →  JSON array of product entries.
         3. Parse, validate, return ProductManifest.
-        4. Post-LLM safety net: merge sub-sections into parent products.
         """
         print("\n=== PRODUCT DISCOVERY ===")
         digest = self._build_page_digest(pages)
@@ -215,11 +197,6 @@ class RFPRequirementExtractor:
         if not manifest.products and len(pages) > DISCOVERY_PAGE_BATCH_SIZE:
             logger.info("Retrying product discovery in page batches")
             manifest = self._discover_products_in_batches(pages)
-
-        # ── Post-LLM safety net: merge sub-sections into parent products ──
-        if len(manifest.products) > 1:
-            manifest = self._merge_subsections_into_parents(manifest)
-
         print(f"\n{manifest.display()}")
         return manifest
 
@@ -301,48 +278,46 @@ class RFPRequirementExtractor:
 
     def _build_page_digest(self, pages: List[PageText]) -> str:
         """
-        Build a page-by-page digest that preserves heading hierarchy.
-
-        Each heading is shown on its own line with indentation reflecting depth,
-        so the LLM can visually distinguish parent product headings from their
-        child sub-sections.
+        Build an indented heading outline so the LLM receives structural depth
+        information, not just a flat list.
 
         Output format:
-            Page   12
-              HEADING [depth-1]: 3. Next-Generation Firewall
-              HEADING [depth-2]:   3.1 General Requirements
-              HEADING [depth-2]:   3.2 Performance Requirements
-              SIGNAL: The firewall shall support minimum 10 Gbps throughput
-            Page   19
-              HEADING [depth-1]: 4. SIEM Solution
+            Page  12 |   3  Next-Generation Firewall
+            Page  12 |     3.1  General Requirements
+            Page  13 |     3.2  Performance Requirements
+            Page  19 |   4  SIEM Solution
+            ...
+
+        Indentation = 2 spaces × (depth - 1).  ALL-CAPS headings (depth 0)
+        get no indentation.  This lets the LLM visually distinguish parent
+        product headings from their child sub-sections without reasoning about
+        numbering conventions.
         """
         rows: List[str] = []
         for p in pages:
-            page_lines: List[str] = [f"Page {p.page_number:>4}"]
-            heading_count = 0
-            signal_count = 0
+            headings: List[str] = []
+            signals: List[str] = []
             for raw_line in p.text.splitlines():
                 line = raw_line.strip()
                 if not line:
                     continue
                 is_heading, depth = self._is_heading_line(line)
-                if is_heading and heading_count < 8:
+                if is_heading:
                     indent = "  " * max(0, depth - 1)
-                    depth_label = f"depth-{depth}" if depth > 0 else "top"
-                    page_lines.append(f"  HEADING [{depth_label}]: {indent}{line}")
-                    heading_count += 1
+                    headings.append(f"{indent}{line}")
                     continue
-                if signal_count < 3 and self._looks_like_requirement_signal(line):
-                    page_lines.append(f"  SIGNAL: {self._compact_line(line, max_chars=120)}")
-                    signal_count += 1
+                if self._looks_like_requirement_signal(line):
+                    signals.append(self._compact_line(line, max_chars=135))
 
-            # Only add excerpt if no headings or signals were found on this page
-            if heading_count == 0 and signal_count == 0:
-                excerpt = self._page_excerpt(p.text, max_chars=150)
-                if excerpt:
-                    page_lines.append(f"  EXCERPT: {excerpt}")
-
-            rows.append(self._fit_text("\n".join(page_lines), DISCOVERY_PAGE_CHAR_BUDGET))
+            excerpt = self._page_excerpt(p.text, max_chars=180)
+            page_rows = [f"Page {p.page_number:>4}"]
+            if headings:
+                page_rows.append("  Headings: " + " | ".join(headings[:5]))
+            if signals:
+                page_rows.append("  Signals: " + " | ".join(signals[:5]))
+            if excerpt:
+                page_rows.append("  Excerpt: " + excerpt)
+            rows.append(self._fit_text("\n".join(page_rows), DISCOVERY_PAGE_CHAR_BUDGET))
         return self._fit_text("\n".join(rows), DISCOVERY_DIGEST_CHAR_BUDGET)
 
     def _looks_like_requirement_signal(self, line: str) -> bool:
@@ -359,7 +334,7 @@ class RFPRequirementExtractor:
             return True
         if re.search(r"\b\d+(?:\.\d+)?\s*(gbps|mbps|tb|gb|mb|users|sessions|eps|ports?)\b", lower):
             return True
-        if re.match(r"^[-*•]|\d+[\.\\)]\s+", line):
+        if re.match(r"^[-*•]|\d+[\.\)]\s+", line):
             return True
         return False
 
@@ -378,105 +353,157 @@ class RFPRequirementExtractor:
         trimmed = text[: max_chars - 3].rsplit(" ", 1)[0]
         return f"{trimmed}..."
 
+    def _llm_discover_products_heading_outline_legacy(
+        self, digest: str, total_pages: int
+    ) -> ProductManifest:
+        """
+        Single LLM call on the indented heading outline.
+
+        The prompt is framed as a two-step structural parse:
+          Step 1 — identify the shallowest numbered level that contains product
+                   names (usually depth-1 headings like "3. SIEM", not depth-2
+                   like "3.1 Performance").
+          Step 2 — for each product heading, record start/end pages using only
+                   the page numbers printed in the outline.
+
+        The LLM is explicitly forbidden from inferring products that do not
+        appear as headings in the outline.
+        """
+        prompt = f"""You are a document structure parser. You will receive an
+indented heading outline extracted from an RFP. Each line shows a page number
+and a heading. Indentation reflects nesting depth (deeper = child section).
+
+Your task is to identify every product or service that has its own dedicated
+requirements section in this RFP, and return the exact page range for each.
+
+Follow these two steps internally, then output only the final JSON:
+
+STEP 1 — Identify the correct heading depth for product sections:
+  Look at the outline and find the SHALLOWEST level of numbered headings that
+  contain distinct product or service names (e.g. "3. SIEM Solution",
+  "4. Next-Generation Firewall").  These are the product headings.
+  Deeper headings at that same section number (e.g. "3.1 Performance",
+  "3.2 Logging") are sub-sections WITHIN a product — do NOT treat them as
+  separate products.
+
+STEP 2 — For each product heading from Step 1:
+  - "product"    = the heading text, copied VERBATIM from the outline.
+                   Do not paraphrase, shorten, strip numbering, or rename.
+  - "start_page" = the page number shown on that heading's line.
+  - "end_page"   = the page number shown on the line immediately before the
+                   NEXT sibling product heading, or {total_pages} for the last.
+
+Hard rules:
+  - Only include headings that are VISIBLE IN THE OUTLINE BELOW.
+    Do not infer or hallucinate product names from your general knowledge.
+  - Exclude: cover page titles, table-of-contents lines, glossary sections,
+    scope/introduction sections, commercial/contractual sections.
+  - If a product heading appears in the table of contents AND again in the
+    body, use the body occurrence (higher page number).
+
+Return ONLY a JSON array. No markdown, no code fences, no explanation.
+
+Each object must have exactly these keys:
+  "product"    – verbatim heading text (string)
+  "start_page" – integer, 1-based
+  "end_page"   – integer, 1-based
+
+HEADING OUTLINE:
+{digest}
+"""
+
+        try:
+            response = llm.generate(prompt, max_tokens=1200)
+            response = self._clean_llm_response(response)
+            data = self._loads_json(response)
+
+            if not isinstance(data, list):
+                raise ValueError(f"Expected list, got {type(data)}")
+
+            products: List[ProductEntry] = []
+            for item in data:
+                name  = str(item.get("product", "")).strip()
+                start = int(item["start_page"])
+                end   = int(item["end_page"])
+
+                # ── post-parse sanity filter ───────────────────────────────
+                # Reject entries whose name looks like noise rather than a
+                # real product section heading.
+                if self._is_junk_product_name(name):
+                    logger.debug(f"Rejected junk product name: {name!r}")
+                    continue
+
+                # Clamp page numbers to valid range
+                start = max(1, min(start, total_pages))
+                end   = max(start, min(end, total_pages))
+
+                products.append(ProductEntry(
+                    product=name,
+                    start_page=start,
+                    end_page=end,
+                ))
+
+            products.sort(key=lambda p: p.start_page)
+            return ProductManifest(products=products)
+
+        except Exception as exc:
+            logger.warning(f"Product discovery LLM call failed: {exc}")
+            logger.warning(f"Raw response was: {response!r}")
+            return ProductManifest(products=[])
+
     # ──────────────────────────────────────────────────────────────────────────
-    # PHASE 1C – LLM PRODUCT DISCOVERY
+    # PHASE 2 – PRODUCT-SPECIFIC REQUIREMENT EXTRACTION
     # ──────────────────────────────────────────────────────────────────────────
 
     def _llm_discover_products(
         self, digest: str, total_pages: int
     ) -> ProductManifest:
         """
-        Discover demanded products from page-level evidence.
-
-        The prompt is carefully designed to prevent the LLM from treating
-        requirement sub-sections (e.g. "Performance", "High Availability")
-        as separate products. It uses:
-          - Explicit definition of what a product IS vs. IS NOT
-          - Concrete examples of correct vs. incorrect output
-          - Depth-label hints from the digest
+        Discover demanded products from page-level evidence, not just headings.
+        The model may infer product labels from contextual requirements, but it
+        must also return the exact pages that justify each product.
         """
         response = ""
-        prompt = f"""You are an expert RFP analyst. You will receive a structured
-digest of an RFP document. Each page shows its headings (with depth level) and
-key requirement signals.
+        prompt = f"""You are an expert RFP analyst. You will receive a page-wise
+digest of an RFP. Each page includes headings and body excerpts that may contain
+requirements. The RFP may demand products, platforms, modules, subscriptions,
+appliances, software, services, or solution areas without naming them directly.
 
-Your task: Identify the PRODUCTS or SOLUTIONS that this RFP is asking vendors
-to supply. Return the page numbers where each product's requirements appear.
+Your task:
+1. Identify ALL distinct demanded products or solution areas in the RFP.
+2. Contextually infer a clear product label when the RFP describes capabilities
+   without a direct product name.
+3. Assign every page that contains requirements, specifications, scope, or
+   evaluation criteria for that product to that product.
 
-=== CRITICAL DEFINITIONS ===
-
-A PRODUCT is something the buyer wants to PURCHASE or DEPLOY:
-  - A physical appliance (e.g., "Next-Generation Firewall", "Core Switch")
-  - A software platform (e.g., "SIEM Solution", "Endpoint Protection")
-  - A service (e.g., "Managed SOC Service", "Cloud Backup Service")
-  - A complete solution area (e.g., "Data Center Networking", "WAN Edge")
-
-The following are NOT products — they are sub-sections/requirements WITHIN a
-product. Do NOT list these as separate products:
-  - Performance Requirements, Capacity Requirements
-  - High Availability, Redundancy, Failover
-  - Logging, Monitoring, Reporting
-  - Security Features, Authentication, Encryption
-  - Management, Configuration, Deployment
-  - Integration, API, Compatibility
-  - Licensing, Support, Warranty, Training
-  - Compliance, Certifications
-  - General Requirements, Technical Requirements
-  - Scalability, Architecture, Topology
-
-=== HOW TO DECIDE ===
-
-Look at the heading DEPTH in the digest:
-  - depth-1 headings (like "3. Next-Generation Firewall") are usually PRODUCTS
-  - depth-2 headings (like "3.1 Performance Requirements") are SUB-SECTIONS
-    within that product — do NOT treat them as separate products
-  - depth-3+ headings are even deeper sub-sections
-
-If a depth-1 heading contains a product name AND has depth-2 children that
-describe requirement areas, the depth-1 heading is the product and ALL its
-children's pages belong to it.
-
-=== EXAMPLE ===
-
-Given this heading structure:
-  HEADING [depth-1]: 3. Next-Generation Firewall
-  HEADING [depth-2]:   3.1 General Requirements
-  HEADING [depth-2]:   3.2 Performance Requirements
-  HEADING [depth-2]:   3.3 High Availability
-  HEADING [depth-1]: 4. SIEM Solution
-  HEADING [depth-2]:   4.1 Log Collection
-  HEADING [depth-2]:   4.2 Correlation Rules
-
-CORRECT output: 2 products → "Next-Generation Firewall" (all pages 3.x) and
-"SIEM Solution" (all pages 4.x)
-
-WRONG output: 7 products including "Performance Requirements" and "High
-Availability" as separate products — these are sub-sections, not products!
-
-=== INSTRUCTIONS ===
-
-1. Scan the digest for top-level product/solution sections
-2. For each product, collect ALL pages that contain its requirements
-   (including all sub-section pages)
-3. A page may belong to multiple products if it genuinely covers multiple
-   products (rare)
-4. Exclude: cover pages, table of contents, glossary, instructions to
-   bidders, commercial/contractual/legal sections
-5. Merge synonyms (e.g. "NGFW" and "Next-Generation Firewall" → one entry)
+Hard rules:
+- Do not use a fixed product taxonomy or hardcoded product categories.
+- Infer labels only from the text in the digest, not from outside knowledge.
+- A page may belong to multiple products if it has requirements for multiple
+  demanded products.
+- Exclude cover page titles, table-of-contents lines, glossary sections,
+  instructions to bidders, commercial/contractual/legal sections, and generic
+  background unless they contain product requirements.
+- Merge synonyms and variants that refer to the same demanded item.
+- Keep separate products separate when their requirements could lead to
+  different compliance reports.
 
 Return ONLY a JSON array. No markdown, no code fences, no explanation.
 
 Each object must have exactly these keys:
-  "product"  - concise product/solution label (not a requirement category)
+  "product"  - concise product/solution label from the RFP context
   "pages"    - sorted array of unique 1-based page numbers for that product
-  "evidence" - one-line justification from the digest
+  "evidence" - short phrase from the digest explaining why this is a product
 
 RFP PAGE DIGEST:
 {digest}
 """
 
         try:
-            response = llm.generate(prompt, max_tokens=2000)
+            response = llm.generate(prompt, max_tokens=1200)
+            print("\n===== RAW RESPONSE =====")
+            print(response[:5000])
+            print("========================\n")
             data = self._loads_json(self._clean_llm_response(response))
             if not isinstance(data, list):
                 raise ValueError(f"Expected list, got {type(data)}")
@@ -498,11 +525,6 @@ RFP PAGE DIGEST:
 
                 if self._is_junk_product_name(name) or not page_numbers:
                     logger.debug(f"Rejected junk product name: {name!r}")
-                    continue
-
-                # ── Reject names that look like requirement sub-sections ──
-                if self._looks_like_subsection_name(name):
-                    logger.debug(f"Rejected sub-section name as product: {name!r}")
                     continue
 
                 key = self._normalise_product_key(name)
@@ -564,17 +586,9 @@ RFP PAGE DIGEST:
                     pages=sorted(set(pages)),
                 )
 
-        merged_manifest = ProductManifest(
+        return ProductManifest(
             products=sorted(by_name.values(), key=lambda p: p.start_page)
         )
-        # Apply sub-section merge on batch results too
-        if len(merged_manifest.products) > 1:
-            merged_manifest = self._merge_subsections_into_parents(merged_manifest)
-        return merged_manifest
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # PHASE 2 – PRODUCT-SPECIFIC REQUIREMENT EXTRACTION
-    # ──────────────────────────────────────────────────────────────────────────
 
     def extract_for_product(
         self,
@@ -844,133 +858,6 @@ TEXT:
             return True
 
         return False
-
-    def _looks_like_subsection_name(self, name: str) -> bool:
-        """
-        Return True if the name looks like a requirement sub-section rather
-        than a purchasable product.
-
-        Examples that should return True:
-          - "Performance Requirements"
-          - "High Availability"
-          - "General Technical Specifications"
-          - "Logging & Reporting"
-
-        Examples that should return False:
-          - "Next-Generation Firewall"
-          - "SIEM Solution"
-          - "Core Switch"
-        """
-        # Strip section numbering (e.g. "3.1" from "3.1 Performance Requirements")
-        cleaned = re.sub(r"^\s*\d+(?:\.\d+)*[\s\.\):_-]+", "", name).strip()
-        if not cleaned:
-            return False
-
-        lower = cleaned.lower()
-        words = set(lower.replace("-", " ").replace("&", " ").split())
-
-        # If the ENTIRE name (after stripping numbering) is just subsection
-        # indicator words, it's a sub-section
-        if words and words <= _SUBSECTION_INDICATORS:
-            return True
-
-        # If the name is short (1-3 words) and any word is a strong subsection
-        # indicator, treat it as a sub-section
-        _STRONG_INDICATORS = {
-            "requirements", "requirement", "specifications", "specification",
-            "criteria", "evaluation", "scoring",
-        }
-        if len(words) <= 3 and (words & _STRONG_INDICATORS):
-            return True
-
-        return False
-
-    def _merge_subsections_into_parents(self, manifest: ProductManifest) -> ProductManifest:
-        """
-        Post-LLM safety net: detect products whose page ranges are entirely
-        contained within another product's range AND whose names look like
-        requirement sub-categories. Merge their pages into the parent.
-
-        This catches cases where the LLM still returns sub-sections as products
-        despite the improved prompt.
-        """
-        products = list(manifest.products)
-        if len(products) <= 1:
-            return manifest
-
-        # Build page sets for overlap detection
-        page_sets = [
-            set(p.pages or range(p.start_page, p.end_page + 1))
-            for p in products
-        ]
-
-        absorbed: set[int] = set()  # indices of products to remove
-
-        for i, child in enumerate(products):
-            if i in absorbed:
-                continue
-            child_pages = page_sets[i]
-
-            for j, parent in enumerate(products):
-                if i == j or j in absorbed:
-                    continue
-                parent_pages = page_sets[j]
-
-                # Check if child's pages are a subset of (or largely overlap with)
-                # the parent's pages
-                if not child_pages:
-                    continue
-                overlap = child_pages & parent_pages
-                overlap_ratio = len(overlap) / len(child_pages)
-
-                # Child is mostly contained in parent
-                if overlap_ratio >= 0.6:
-                    # Check if child name looks like a sub-section
-                    if self._looks_like_subsection_name(child.product):
-                        logger.info(
-                            f"Merging sub-section '{child.product}' into "
-                            f"parent '{parent.product}'"
-                        )
-                        # Merge child pages into parent
-                        merged = sorted(parent_pages | child_pages)
-                        products[j] = ProductEntry(
-                            product=parent.product,
-                            start_page=min(merged),
-                            end_page=max(merged),
-                            pages=merged,
-                        )
-                        page_sets[j] = set(merged)
-                        absorbed.add(i)
-                        break
-
-                # Also check: if child pages are entirely within parent's
-                # start/end range (even if parent doesn't list every page)
-                if (child.start_page >= parent.start_page and
-                    child.end_page <= parent.end_page and
-                    self._looks_like_subsection_name(child.product)):
-                    logger.info(
-                        f"Merging sub-section '{child.product}' (range-contained) "
-                        f"into parent '{parent.product}'"
-                    )
-                    merged = sorted(parent_pages | child_pages)
-                    products[j] = ProductEntry(
-                        product=parent.product,
-                        start_page=min(merged),
-                        end_page=max(merged),
-                        pages=merged,
-                    )
-                    page_sets[j] = set(merged)
-                    absorbed.add(i)
-                    break
-
-        remaining = [
-            p for i, p in enumerate(products) if i not in absorbed
-        ]
-        if absorbed:
-            logger.info(
-                f"Sub-section merge: {len(manifest.products)} → {len(remaining)} products"
-            )
-        return ProductManifest(products=remaining)
 
     def _clean_llm_response(self, response: str) -> str:
         response = self._THINK_RE.sub("", response).strip()

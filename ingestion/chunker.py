@@ -65,6 +65,54 @@ _SECTION_CHUNK_TYPE_MAP = {
     "operating conditions": ChunkType.ENVIRONMENTAL,
 }
 
+# ─── Canonical Section Name Normalization ──────────────────────────────────────
+# Maps garbled OCR section names (usually PDF table column headers captured as
+# section titles) to human-readable canonical names used in chunk metadata.
+# The keys are lowercased and stripped before lookup.
+
+_CANONICAL_SECTION_NAMES: Dict[str, str] = {
+    # FortiGate 7000F series — garbled two-column spec table headers
+    "fg-7081f-dc fg-7081f-2-dc fg-7081f-dc fg-7081f-2-dc": "System Performance and Capacity",
+    "fg-7121f* fg-7121f-2-dc fg-7121f* fg-7121f-2-dc": "System Performance and Capacity",
+    "fg-7121f-dc fg-7121f-2-dc": "System Performance and Capacity",
+    "152a@48v 154a@48v": "Power Specifications",
+    "174@48v /": "Power Specifications",
+    "127@48v / 152a@48v": "Power Specifications",
+    "power console": "Hardware Interfaces",
+    "secure module module secure": "Hardware Interfaces",
+    "np7 tpm 400/100/40/25/10/ge 8tb": "Hardware Features",
+    "np7 cp9 tpm 100/40/25/10/ge": "Hardware Features",
+    "service enterprise unified threat advanced threat": "Subscription Bundles",
+    "malicious certificate": "Web/DNS Security",
+    "outbreak check": "Attack Surface Security",
+    "fortitelemetry cloud": "SD-WAN and SASE Services",
+    "fortianalyzer cloud": "NOC and SOC Services",
+    "hardware forticare essentials desktop": "FortiCare Services",
+    "forticare elite": "FortiCare Services",
+    "hardware model": "Ordering Information",
+    "processor module": "Ordering Information",
+    "40 ge qsfp+ 400 ge qsfp-dd": "Interface Specifications",
+    # Generic patterns for other garbled headers
+    "to deliver:": "Key Capabilities",
+}
+
+
+def _canonicalize_section_name(section_name: str) -> str:
+    """Return a clean, human-readable section name.
+
+    Tries an exact lowercased lookup first, then a substring scan for known
+    garbled prefixes.  Falls back to title-casing the original name.
+    """
+    key = section_name.lower().strip()
+    if key in _CANONICAL_SECTION_NAMES:
+        return _CANONICAL_SECTION_NAMES[key]
+    # Substring scan: if the garbled key starts with a known prefix keep it
+    for garbled, canonical in _CANONICAL_SECTION_NAMES.items():
+        if key.startswith(garbled[:20]):
+            return canonical
+    # Default: apply title-case to make at least cosmetically readable
+    return section_name.title()
+
 
 def _section_to_chunk_type(section_name: str) -> ChunkType:
     key = section_name.lower().strip()
@@ -72,6 +120,38 @@ def _section_to_chunk_type(section_name: str) -> ChunkType:
         if pattern in key:
             return ctype
     return ChunkType.GENERAL
+
+
+# ─── Line Deduplication ──────────────────────────────────────────────────────────
+
+def _dedup_lines(text: str) -> str:
+    """Remove consecutive duplicate lines produced by multi-column PDF extraction.
+
+    Two-column spec tables extracted by pdfplumber often emit each line twice
+    because the left and right columns of the same row are concatenated without
+    deduplication.  This function removes immediately repeated non-empty lines
+    while preserving intentional repetition (e.g. two different spec rows that
+    happen to share a value).
+
+    Strategy: scan the line list and drop line[i] if it is identical to
+    line[i-1] (after stripping).  This is conservative — it only removes
+    back-to-back duplicates, not all duplicates.
+    """
+    lines = text.split("\n")
+    deduped: List[str] = []
+    prev_stripped = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped and stripped == prev_stripped:
+            # Skip exact consecutive duplicate (empty lines are allowed to repeat)
+            continue
+        deduped.append(line)
+        if stripped:
+            prev_stripped = stripped
+        # Reset on blank lines so blank-line-separated sections don't cross-suppress
+        else:
+            prev_stripped = None
+    return "\n".join(deduped)
 
 
 # ─── Text Splitter ────────────────────────────────────────────────────────────────
@@ -160,6 +240,9 @@ def chunk_model_spec(
             doc.doc_id, model.model_id,
             f"{section_name}_{chunk_type.value}", chunk_index
         )
+        # Use the model's narrowed source_pages (set by _assign_model_page_ranges)
+        # rather than always defaulting to page 1 of the full document.
+        _pages = model.source_pages or []
         return DocumentChunk(
             chunk_id=cid,
             text=text,
@@ -172,9 +255,9 @@ def chunk_model_spec(
             chunk_type=chunk_type,
             section_name=section_name,
             source_file=doc.source_path,
-            source_pages=model.source_pages,
-            page_start=model.source_pages[0] if model.source_pages else None,
-            page_end=model.source_pages[-1] if model.source_pages else None,
+            source_pages=_pages,
+            page_start=_pages[0] if _pages else None,
+            page_end=_pages[-1] if _pages else None,
             table_index=table_index,
             extraction_method=doc.extraction_method.value,
             pipeline_version=doc.pipeline_version,
@@ -211,16 +294,21 @@ def chunk_model_spec(
         if not section_text.strip():
             continue
 
-        chunk_type = _section_to_chunk_type(section_name)
+        # Normalize garbled OCR section names to canonical human-readable names
+        canonical_name = _canonicalize_section_name(section_name)
+        chunk_type = _section_to_chunk_type(canonical_name)
+
+        # Deduplicate repeated lines before building the chunk text
+        clean_section_text = _dedup_lines(section_text)
 
         # Build a context header for each chunk so it's self-contained
         header = (
             f"Vendor: {model.vendor} | Model: {model.model_name}"
             + (f" | Family: {model.product_family}" if model.product_family else "")
-            + f"\nSection: {section_name}\n\n"
+            + f"\nSection: {canonical_name}\n\n"
         )
 
-        full_section_text = header + section_text
+        full_section_text = header + clean_section_text
 
         # Tables get their own size budget; specs get the spec budget
         if chunk_type == ChunkType.SPEC_TABLE:
@@ -231,7 +319,7 @@ def chunk_model_spec(
         sub_chunks = _split_text(full_section_text, size, overlap)
         for i, chunk_text in enumerate(sub_chunks):
             chunks.append(
-                make_chunk(chunk_text, chunk_type, section_name, chunk_index=i)
+                make_chunk(chunk_text, chunk_type, canonical_name, chunk_index=i)
             )
 
     # ── 4. Spec tables ────────────────────────────────────────────────────────
