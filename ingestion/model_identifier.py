@@ -1,13 +1,37 @@
 """
 OEM Datasheet Ingestion Pipeline - Model Identification
-Identifies distinct product models within a datasheet (a single datasheet
-may describe one or many models, e.g. an entire product series).
+Identifies distinct product models within a datasheet.
+
+Architecture
+------------
+1. Table-based extraction - parses comparison / ordering tables   (fast)
+2. Regex candidate sweep  - pattern-match model numbers in full text (fast)
+3. LLM filter (if enabled)- given the candidate list, eliminate non-models
+                            (cheap: sends a small JSON list, not raw text)
+4. Single-model fallback  - whole doc = one product entry
+
+The LLM is now used only as a *filter / validator* over candidates already
+found by parsing.  This is much faster and cheaper than asking the LLM to
+scan 6 k chars of raw text:
+  - Old: LLM reads full text → produces model list from scratch
+  - New: Parsing finds candidates → LLM receives only the candidate names
+         and removes false positives / non-product strings.
+
+Section enrichment  (multi-model)
+----------------------------------
+Per-model sections  → only added to the model(s) explicitly mentioned
+Family sections     → stored ONCE on models[0]; chunker emits them once
+                      so the vector DB holds N model chunks + 1 family chunk
+                      instead of N copies of the same text.
+
+This is the single most important fix for preventing chunk explosion:
+previously every model received a full copy of the shared sections.
 """
 from __future__ import annotations
 
 import json
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -15,28 +39,47 @@ from config.settings import ModelIdentificationConfig, PipelineConfig
 from models.schemas import ExtractedTable, ModelSpec
 from ingestion.classifier import detect_category
 
-# ─── Pattern Compilation ────────────────────────────────────────────────────────
 
-# Module-level cache: config id → compiled patterns list.
-# _compile_model_patterns was previously called inside every helper that needed
-# patterns, recompiling the same regexes thousands of times per document.
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Section names that belong to the whole product family, not a single SKU.
+# These are stored ONCE on models[0]; the chunker emits them once.
+_FAMILY_SECTION_KEYWORDS: FrozenSet[str] = frozenset({
+    "overview", "introduction", "description",
+    "features", "key features", "product features", "highlights",
+    "certifications", "compliance", "regulatory", "standards",
+    "ordering", "ordering information", "part number", "sku",
+    "environmental", "operating conditions",
+    "warranty", "support", "services",
+    "use cases", "solution overview",
+})
+
+
+def _is_family_section(name: str) -> bool:
+    key = name.lower().strip()
+    return any(kw in key for kw in _FAMILY_SECTION_KEYWORDS)
+
+
+# ---------------------------------------------------------------------------
+# Pattern compilation cache
+# ---------------------------------------------------------------------------
+
 _PATTERN_CACHE: Dict[int, List[re.Pattern]] = {}
 
 
 def _compile_model_patterns(cfg: ModelIdentificationConfig) -> List[re.Pattern]:
     key = id(cfg)
     if key not in _PATTERN_CACHE:
-        _PATTERN_CACHE[key] = [re.compile(p, re.IGNORECASE) for p in cfg.model_number_patterns]
+        _PATTERN_CACHE[key] = [
+            re.compile(p, re.IGNORECASE) for p in cfg.model_number_patterns
+        ]
     return _PATTERN_CACHE[key]
 
 
 def _build_combined_pattern(model_names: List[str]) -> re.Pattern:
-    """Build one combined OR-pattern that matches any of the given model names.
-
-    Sorting longest-first prevents FG-7081F from matching before FG-7081F-DC.
-    The caller can then use a single findall/search to locate ALL model names
-    in a text instead of running one re.search per model.
-    """
+    """Build one OR-pattern matching any of the given model names (longest first)."""
     sorted_names = sorted(model_names, key=len, reverse=True)
     inner = "|".join(re.escape(n) for n in sorted_names)
     return re.compile(
@@ -45,153 +88,128 @@ def _build_combined_pattern(model_names: List[str]) -> re.Pattern:
     )
 
 
-# ─── Section Splitter ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Section splitter
+# ---------------------------------------------------------------------------
 
-def split_into_sections(
-    pages: List[dict],
-) -> Dict[str, List[str]]:
+def split_into_sections(pages: List[dict]) -> Dict[str, List[str]]:
     """
     Walk all page texts and segment them into named sections.
     Returns {section_name: [text_lines...]}
-
-    Common section structures in OEM datasheets:
-    - "Overview / Introduction"
-    - "Technical Specifications"
-    - "Ordering Information"
-    - "Features"
-    - "Certifications"
     """
     sections: Dict[str, List[str]] = {"_preamble": []}
-    current_section = "_preamble"
+    current = "_preamble"
 
     for page in pages:
         text = page.get("cleaned_text", "")
-        lines = text.splitlines()
-        for line in lines:
+        for line in text.splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
-            # Check if this line looks like a section heading
             if _is_section_heading(stripped):
-                current_section = stripped.upper()
-                if current_section not in sections:
-                    sections[current_section] = []
+                current = stripped.upper()
+                if current not in sections:
+                    sections[current] = []
             else:
-                sections.setdefault(current_section, []).append(stripped)
+                sections.setdefault(current, []).append(stripped)
 
     return sections
 
 
 def _is_section_heading(line: str) -> bool:
-    """
-    Heuristic to detect section headings:
-    - Numbered headings (e.g., 1. Introduction, 2.1 Technical Specs)
-    - Contains standard section keywords (e.g., Overview, Ordering Information)
-    - Stricter ALL CAPS lines (no digits, no typical unit measurements)
-    """
-    line_clean = line.strip()
-    if not (3 <= len(line_clean) <= 70):
+    line = line.strip()
+    if not (3 <= len(line) <= 70):
+        return False
+    if line.startswith(("•", "-", "*", "o ", "+ ")):
+        return False
+    if line[-1] in {":", ",", ".", ";", "?", "!"}:
+        return False
+    words = line.split()
+    if words and words[-1].lower() in {
+        "with", "and", "or", "for", "in", "on", "at", "by", "to", "of"
+    }:
         return False
 
-    # Exclude lines starting with bullet points or list markers
-    if line_clean.startswith(('•', '-', '*', 'o ', '+ ')):
+    _UNITS = {"gbps", "mbps", "mpps", "tb", "gb", "mb", "w", "v", "a",
+               "hz", "db", "btu/h", "million", "billion", "sessions", "users"}
+    if words and words[-1].lower().rstrip(".,;:") in _UNITS:
         return False
 
-    # Exclude lines ending with punctuation (colons, commas, periods, etc.)
-    if line_clean[-1] in {':', ',', '.', ';', '?', '!'}:
-        return False
-
-    # Exclude lines ending with prepositions/conjunctions (usually indicating a wrapped line)
-    words = line_clean.split()
-    if words and words[-1].lower() in {"with", "and", "or", "for", "in", "on", "at", "by", "to", "of"}:
-        return False
-
-    # Exclude lines ending with units or common spec terms (e.g., "13.5 Gbps", "5.4 Million")
-    UNITS_AND_SPECS = {"gbps", "mbps", "mpps", "tb", "gb", "mb", "w", "v", "a", "hz", "db", "btu/h", "million", "billion", "sessions", "users"}
-    if words and words[-1].lower().rstrip('.,;:') in UNITS_AND_SPECS:
-        return False
-
-    # Numbered heading pattern (e.g., "1. Introduction", "2.1 Technical Specifications")
-    # Must have a dot/parenthesis for single digits, or contain dots (e.g. "2.1")
-    if re.match(r'^(\d+\.\d+(\.\d+)*|\d+[\.\)])\s+[A-Z]', line_clean):
+    if re.match(r'^(\d+\.\d+(\.\d+)*|\d+[\.\)])\s+[A-Z]', line):
         return True
 
-    # Check against known standard section keywords
-    line_lower = line_clean.lower()
-    
-    # 1. Check multi-word keywords (can appear anywhere in the line)
-    MULTI_WORD_KEYWORDS = {
+    line_lower = line.lower()
+
+    _MULTI = {
         "technical specifications", "hardware specifications",
-        "system specifications", "product specifications", "specifications table",
-        "technical specs", "hardware specs", "system specs",
+        "system specifications", "product specifications",
         "ordering information", "ordering info", "part numbers",
-        "operating conditions", "environmental specifications", "environmental specs",
+        "operating conditions", "environmental specifications",
         "key features", "features & benefits", "product features",
-        "product overview", "system overview", "use cases"
+        "product overview", "system overview", "use cases",
     }
-    for kw in MULTI_WORD_KEYWORDS:
-        if kw in line_lower:
-            return True
-            
-    # 2. Check brief keywords (must match exactly or be the start of the heading)
-    BRIEF_KEYWORDS = {
-        "overview", "features", "specifications", "specs", "ordering", "compliance",
-        "certifications", "regulatory", "standards", "interfaces", "connectivity",
-        "dimensions", "physical", "power", "electrical", "environmental", "support",
-        "warranty", "performance"
+    if any(kw in line_lower for kw in _MULTI):
+        return True
+
+    _BRIEF = {
+        "overview", "features", "specifications", "specs", "ordering",
+        "compliance", "certifications", "regulatory", "standards",
+        "interfaces", "connectivity", "dimensions", "physical",
+        "power", "electrical", "environmental", "support", "warranty",
+        "performance",
     }
-    for kw in BRIEF_KEYWORDS:
-        if line_lower == kw or line_lower.startswith(kw + " ") or line_lower.startswith(kw + ":") or line_lower.startswith(kw + " -"):
+    for kw in _BRIEF:
+        if (line_lower == kw
+                or line_lower.startswith(kw + " ")
+                or line_lower.startswith(kw + ":")):
             return True
 
-    # ALL CAPS strict checks for custom section titles
-    if line_clean.isupper() and 2 <= len(words) <= 5:
-        # Exclude typical table headers/data containing numbers or units
-        if not re.search(r'\d', line_clean) and not any(u in line_lower for u in ["gbps", "mbps", "tb", "gb", "mpps", "v", "w", "hz", "db"]):
+    # Strict ALL-CAPS heading
+    if line.isupper() and 2 <= len(words) <= 5:
+        if not re.search(r'\d', line) and not any(
+            u in line_lower for u in ["gbps", "mbps", "tb", "gb", "v", "w", "hz"]
+        ):
             return True
 
     return False
 
 
-# ─── Model Number Extraction ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Model number extraction (regex fallback)
+# ---------------------------------------------------------------------------
 
 def extract_candidate_model_numbers(
     full_text: str,
     cfg: ModelIdentificationConfig,
 ) -> Dict[str, int]:
-    """
-    Scan full document text for candidate model/part numbers.
-    Returns {model_number: occurrence_count}, sorted by frequency.
-    """
+    """Return {model_number: occurrence_count} sorted by frequency."""
     patterns = _compile_model_patterns(cfg)
     counts: Dict[str, int] = {}
     for pattern in patterns:
         for match in pattern.finditer(full_text):
             token = match.group(0).strip().upper()
-            # Filter out common false positives
             if _is_false_positive_model(token):
                 continue
             counts[token] = counts.get(token, 0) + 1
 
-    # Filter by minimum occurrences
-    filtered = {m: c for m, c in counts.items()
-                if c >= cfg.min_model_occurrences}
-
-    # Sort by frequency (descending)
-    return dict(sorted(filtered.items(), key=lambda x: -x[1]))
+    return dict(
+        sorted(
+            {m: c for m, c in counts.items() if c >= cfg.min_model_occurrences}.items(),
+            key=lambda x: -x[1],
+        )
+    )
 
 
 def _is_false_positive_model(token: str) -> bool:
-    """Exclude common tokens that match model patterns but aren't models."""
-    false_positives = {
+    _FP = {
         "IEEE", "HTTP", "HTTPS", "SMTP", "SNMP", "SSH", "SSL", "TLS",
         "VLAN", "OSPF", "BGP", "LACP", "IPV4", "IPV6", "NAT", "VPN",
         "PDF", "USB", "PCB", "LED", "LCD", "CPU", "RAM", "SSD", "HDD",
         "MTBF", "MTTR", "RMA", "EOL", "EOS", "RFP", "SKU", "UPS",
         "AC", "DC", "EN", "ISO", "CE", "FCC", "UL", "CSA", "IP65",
-        "RoHS", "WEEE", "TAA", "USA", "EU", "UK",
+        "ROHS", "WEEE", "TAA", "USA", "EU", "UK",
     }
-    if token in false_positives:
+    if token in _FP:
         return True
     if re.fullmatch(r"SHA[-_]?\d+", token):
         return True
@@ -202,300 +220,358 @@ def _is_false_positive_model(token: str) -> bool:
     return False
 
 
-# ─── Table-Based Model Detection ────────────────────────────────────────────────
+# Matches the suffix that differentiates a specific SKU from a series root,
+# e.g. "20" in PA-3200→PA-3220, or "F" in FG-100→FG-100F.
+# Hardware-variant suffixes like "-DC", "-AC", "-POE" are excluded so we
+# don't mistakenly treat "FG-7081F" as a prefix of "FG-7081F-DC".
+_DIGIT_ONLY_SUFFIX_RE = re.compile(r"\d+$")
+
+
+def _prune_family_prefixes(candidates: List[str]) -> List[str]:
+    """
+    Drop a candidate only when it looks like a series root, i.e.:
+      - It is a string prefix of at least one other candidate, AND
+      - Every longer candidate that starts with it extends with digits only
+        (like PA-3200 → PA-3220/3250/3260), not with a hardware suffix
+        (like FG-7081F → FG-7081F-DC).
+
+    Example kept:   ["FG-7081F", "FG-7081F-DC"]  → both kept (-DC is hardware)
+    Example pruned: ["PA-3200",  "PA-3220", "PA-3250"] → PA-3200 dropped
+    """
+    upper = [c.upper() for c in candidates]
+    pruned = []
+    for i, candidate in enumerate(candidates):
+        cu = upper[i]
+        longer = [upper[j] for j in range(len(upper)) if j != i and upper[j].startswith(cu) and upper[j] != cu]
+        if not longer:
+            pruned.append(candidate)
+            continue
+        # Only drop if every extension beyond the shared prefix is purely numeric
+        all_digit_extensions = all(
+            _DIGIT_ONLY_SUFFIX_RE.search(lon[len(cu):]) and
+            not lon[len(cu):].startswith("-")
+            for lon in longer
+        )
+        if all_digit_extensions:
+            logger.debug(
+                f"[model_id] Dropping '{candidate}' — series-root prefix of "
+                + ", ".join(f"'{c}'" for c in longer)
+            )
+        else:
+            pruned.append(candidate)
+    return pruned
+
+
+def _prune_series_names(candidates: List[str], full_text: str) -> List[str]:
+    """
+    Drop any candidate whose occurrences in the text are overwhelmingly as
+    '<candidate> Series' (i.e. it names a product family, not a specific SKU).
+
+    Threshold: if > 60% of the candidate's occurrences are immediately
+    followed by the word 'Series', treat it as a family name and drop it.
+    """
+    pruned = []
+    for candidate in candidates:
+        escaped = re.escape(candidate)
+        all_hits = re.findall(
+            r"(?<![A-Za-z0-9\-_])" + escaped + r"(?![A-Za-z0-9\-_])",
+            full_text,
+            re.IGNORECASE,
+        )
+        total = len(all_hits)
+        if total == 0:
+            pruned.append(candidate)
+            continue
+
+        series_hits = re.findall(
+            r"(?<![A-Za-z0-9\-_])" + escaped + r"\s+Series\b",
+            full_text,
+            re.IGNORECASE,
+        )
+        series_ratio = len(series_hits) / total
+
+        if series_ratio > 0.6:
+            logger.debug(
+                f"[model_id] Dropping '{candidate}' — {series_ratio:.0%} of "
+                f"occurrences are '<name> Series' (family name, not a SKU)"
+            )
+        else:
+            pruned.append(candidate)
+    return pruned
+
+
+
+# ---------------------------------------------------------------------------
+# Table-based model detection
+# ---------------------------------------------------------------------------
 
 def extract_models_from_tables(
     page_tables: List[dict],
     cfg: ModelIdentificationConfig,
 ) -> List[Dict]:
     """
-    Detect model specification tables (often labelled "Ordering Information"
-    or "Technical Specifications") and extract per-model rows.
+    Parse comparison / ordering tables and return per-model entries.
+    Returns list of {"model_name": str, "spec_row": dict}
     """
-    model_entries = []
+    model_entries: List[Dict] = []
 
-    for page_table in page_tables:
-        headers = [h.lower() for h in page_table.get("headers", [])]
-        raw_headers = page_table.get("headers", [])
-        rows = page_table.get("rows", [])
+    for tbl in page_tables:
+        headers = [str(h).lower() for h in tbl.get("headers", [])]
+        raw_headers = tbl.get("headers", [])
+        rows = tbl.get("rows", [])
 
         if not headers:
             continue
 
+        # Comparison table: model names IN the headers
         header_models = _extract_model_names_from_cells(raw_headers, cfg)
         if header_models:
-            for model_name in header_models:
-                model_entries.append({
-                    "model_name": model_name,
-                    "spec_row": {},
-                })
+            for mn in header_models:
+                model_entries.append({"model_name": mn, "spec_row": {}})
             continue
 
         if not rows:
             continue
 
+        # Comparison table: model names in the first row
         first_row_models = _extract_model_names_from_cells(rows[0], cfg)
         if len(first_row_models) >= 2:
-            for model_name in first_row_models:
-                model_entries.append({
-                    "model_name": model_name,
-                    "spec_row": {},
-                })
+            for mn in first_row_models:
+                model_entries.append({"model_name": mn, "spec_row": {}})
             continue
 
-        # Check if any header looks like a model/part identifier
-        model_col_idx = None
+        # Ordering / spec table: find the column whose header hints at model ID
+        model_col = None
         for i, h in enumerate(headers):
-            for kw in cfg.model_header_keywords:
-                if kw in h:
-                    model_col_idx = i
-                    break
-            if model_col_idx is not None:
+            if any(kw in h for kw in cfg.model_header_keywords):
+                model_col = i
                 break
-
-        if model_col_idx is None:
-            # Try first column as model number by default
-            # if rows look like spec data
-            if _rows_look_like_specs(rows, headers):
-                model_col_idx = 0
-
-        if model_col_idx is None:
+        if model_col is None and _rows_look_like_specs(rows, headers):
+            model_col = 0
+        if model_col is None:
             continue
 
         for row in rows:
-            if not row or model_col_idx >= len(row):
+            if not row or model_col >= len(row):
                 continue
-            model_num = row[model_col_idx].strip()
-            if not _looks_like_model_number(model_num, cfg):
+            mn = row[model_col].strip()
+            if not _looks_like_model_number(mn, cfg):
                 continue
-
-            entry = {
-                "model_name": model_num,
+            model_entries.append({
+                "model_name": _strip_annotation_markers(mn.upper()),
                 "spec_row": {
                     headers[i]: row[i]
                     for i in range(min(len(headers), len(row)))
                     if row[i].strip()
                 },
-            }
-            model_entries.append(entry)
+            })
 
     return model_entries
 
 
 def _extract_model_names_from_cells(
-    cells: List[str],
-    cfg: ModelIdentificationConfig,
+    cells: List[str], cfg: ModelIdentificationConfig
 ) -> List[str]:
-    """Extract model identifiers from header cells in comparison tables."""
-    model_names: List[str] = []
-    seen = set()
     patterns = _compile_model_patterns(cfg)
-
+    seen: Set[str] = set()
+    result: List[str] = []
     for cell in cells:
-        for line_part in re.split(r"[/,\n]+", str(cell or "")):
-            # Strip footnote/annotation markers before matching
-            candidate = _strip_annotation_markers(line_part.strip().upper())
-            if not candidate:
+        for part in re.split(r"[/,\n]+", str(cell or "")):
+            candidate = _strip_annotation_markers(part.strip().upper())
+            if not candidate or candidate in seen:
                 continue
-            if not any(pattern.fullmatch(candidate) for pattern in patterns):
+            if not any(p.fullmatch(candidate) for p in patterns):
                 continue
             if _is_false_positive_model(candidate):
                 continue
-            if candidate not in seen:
-                seen.add(candidate)
-                model_names.append(candidate)
-
-    return model_names
+            seen.add(candidate)
+            result.append(candidate)
+    return result
 
 
 def _strip_annotation_markers(value: str) -> str:
-    """Remove footnote/annotation markers (* † ‡ § # |) from model name strings.
-
-    These appear in datasheets as table footnote references (e.g. 'FG-7121F*')
-    and must be stripped before model name matching or storage so that queries
-    for 'FG-7121F' (without the asterisk) still resolve correctly.
-    """
     return re.sub(r"[*†‡§#|]+$", "", value).strip()
 
 
 def _looks_like_model_number(value: str, cfg: ModelIdentificationConfig) -> bool:
     candidate = _strip_annotation_markers(value.strip().upper())
-    if not candidate or len(candidate) < 3:
-        return False
-    if len(candidate.split()) > 2:
+    if not candidate or len(candidate) < 3 or len(candidate.split()) > 2:
         return False
     if _is_false_positive_model(candidate):
         return False
-    return any(pattern.fullmatch(candidate) for pattern in _compile_model_patterns(cfg))
+    return any(p.fullmatch(candidate) for p in _compile_model_patterns(cfg))
 
 
-def _rows_look_like_specs(
-    rows: List[List[str]], headers: List[str]
-) -> bool:
-    """Check if table rows look like specifications (mix of text + numbers)."""
+def _rows_look_like_specs(rows: List[List[str]], headers: List[str]) -> bool:
     if not rows:
         return False
-    numeric_count = 0
-    for row in rows[:5]:
-        for cell in row:
-            if re.search(r'\d', cell):
-                numeric_count += 1
-    return numeric_count >= len(rows[:5])
+    numeric = sum(
+        1 for row in rows[:5] for cell in row if re.search(r'\d', cell)
+    )
+    return numeric >= len(rows[:5])
 
 
-# ─── LLM-Based Model Identification ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# LLM-based candidate filtering
+# ---------------------------------------------------------------------------
 
-def identify_models_with_llm(
-    full_text: str,
+# Provisioning-only suffixes that do NOT represent distinct hardware SKUs.
+# ZTP = Zero Touch Provisioning, BDL = bundle, LENC = low-encryption export.
+# DC *is* a hardware difference (DC power supply) so it is intentionally absent.
+_SOFT_SUFFIX_RE = re.compile(
+    r"[-_](ZTP|BDL|LENC|NFR|GOV|TAA|EDU|EVAL|DEMO|LAB|DEV|POC)$",
+    re.IGNORECASE,
+)
+
+
+def _prune_soft_variant_suffixes(candidates: List[str]) -> List[str]:
+    """
+    Drop provisioning / bundle / export-control suffix variants when the
+    base model is already present in the candidate list.
+
+    Example: ["FG-7081F", "FG-7081F-ZTP", "FG-7081F-BDL"]
+             → ["FG-7081F"]   (ZTP and BDL are not distinct hardware)
+
+    DC variants are kept because they have a different power supply.
+    """
+    upper_set = {c.upper() for c in candidates}
+    pruned = []
+    for candidate in candidates:
+        m = _SOFT_SUFFIX_RE.search(candidate)
+        if m:
+            base = candidate[: m.start()].upper()
+            if base in upper_set:
+                logger.debug(
+                    f"[model_id] Dropping '{candidate}' — soft-suffix variant "
+                    f"of '{base}' which is already in the candidate list"
+                )
+                continue
+        pruned.append(candidate)
+    return pruned
+
+
+def _parse_llm_json(raw: str, candidate_set: set) -> List[Dict]:
+    """
+    Clean and parse the LLM's JSON response.
+    Handles: empty string, markdown fences, Qwen <think> blocks,
+    bare JSON array, and single-object responses.
+    Returns a filtered list of valid candidate dicts, or [] on any failure.
+    """
+    # Strip Qwen thinking blocks
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    raw = re.sub(r"^```(?:json)?\s*", "", raw).strip()
+    raw = re.sub(r"\s*```$", "", raw).strip()
+
+    if not raw:
+        return []
+
+    # Find the first '[' or '{' — discard any preamble the model snuck in
+    first_bracket = next(
+        (i for i, ch in enumerate(raw) if ch in ("{", "[")), None
+    )
+    if first_bracket is None:
+        return []
+    raw = raw[first_bracket:]
+
+    data = json.loads(raw)          # raises JSONDecodeError on bad JSON
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+
+    return [
+        d for d in data
+        if isinstance(d, dict) and d.get("model_name", "").upper() in candidate_set
+    ]
+
+
+def filter_candidates_with_llm(
+    candidates: List[str],
     vendor: str,
     cfg: PipelineConfig,
-    page_tables: Optional[List[dict]] = None,
+    context_snippet: str = "",
 ) -> List[Dict]:
     """
-    Use the configured local LLM to identify distinct product models and their
-    specifications from the full document text.
+    Given a list of candidate model strings found by parsing, ask the LLM to
+    remove false positives and return the confirmed real product models.
+
+    Robustness improvements vs. the original:
+    - Strips preamble text before the JSON bracket (model leak / thinking noise).
+    - Retries once with a simpler prompt if the first attempt returns empty JSON.
+    - Returns None (not []) to signal total failure so the caller can decide
+      whether to fall back to the unfiltered candidate list.
+
+    Returns:
+        List[Dict]  — confirmed models (may be empty list if LLM found none).
+        None        — LLM call failed entirely; caller should skip filtering.
     """
     if not cfg.use_llm_for_model_id:
-        logger.info("LLM model identification is disabled in config")
-        return []
+        return None
+    if not candidates:
+        return None
+
     try:
         from services.llm_services import llm
     except Exception as e:
-        logger.warning(f"Failed to init LLM client: {e}")
-        return []
+        logger.warning(f"[model_id] LLM init failed: {e}")
+        return None
 
-    # Truncate text to avoid huge token usage; first 6000 chars is usually enough
-    sample_text = full_text[:6000]
+    candidate_set = {c.upper() for c in candidates}
+    candidate_json = json.dumps(candidates)   # compact — fewer tokens
 
-    # Include a sample of tables
-    table_summary = ""
-    if page_tables:
-        table_lines = []
-        for t in page_tables[:5]:
-            hdrs = " | ".join(t.get("headers", []))
-            table_lines.append(f"Table headers: {hdrs}")
-        table_summary = "\nTable summaries:\n" + "\n".join(table_lines)
-
-    prompt = f"""
-You are an OEM cybersecurity datasheet extraction engine.
-
-TASK:
-Identify all distinct product models described in the datasheet.
-
-IMPORTANT:
-Return ONLY valid JSON.
-No explanations.
-No reasoning.
-No analysis.
-No markdown.
-No code fences.
-No comments.
-No <think> tags.
-No text before JSON.
-No text after JSON.
-
-DOCUMENT:
----
-{sample_text}
-
-{table_summary}
----
-
-OUTPUT SCHEMA:
-
-[
-  {{
-    "model_name": "<exact model number>",
-    "product_family": "<series or family name>"
-  }}
-]
-
-EXTRACTION RULES:
-
-1. Extract EVERY distinct product model.
-2. Preserve model names exactly as written.
-3. Treat variants as separate models:
-   - FG-7081F
-   - FG-7081F-DC
-   - FG-7081F-2
-   - FG-7081F-2-DC
-
-   are FOUR separate models.
-
-4. Do NOT merge models.
-5. Do NOT infer missing models.
-6. Do NOT generate descriptions.
-7. Do NOT generate features.
-8. Do NOT generate specifications.
-9. Do NOT generate product categories.
-10. If only one model exists, return a single-element array.
-11. If no model exists, return [].
-
-MODEL IDENTIFICATION PRIORITY:
-
-Highest priority:
-- Product comparison tables
-- Ordering information tables
-- Hardware model lists
-- SKU lists
-
-Lower priority:
-- Marketing text
-- Feature descriptions
-- Use cases
-
-VALID EXAMPLE:
-
-[
-  {{
-    "model_name": "PA-3220",
-    "product_family": "PA-3200 Series"
-  }},
-  {{
-    "model_name": "PA-3250",
-    "product_family": "PA-3200 Series"
-  }},
-  {{
-    "model_name": "PA-3260",
-    "product_family": "PA-3200 Series"
-  }}
-]
-
-JSON ONLY.
-"""
-    try:
-        raw = llm.generate(
-            prompt,
-            temperature=0,
-            max_tokens=3000,
+    context_block = ""
+    if context_snippet:
+        context_block = (
+            f"\nCONTEXT (first 800 chars of document):\n"
+            f"{context_snippet[:800]}\n"
         )
-        # Remove Qwen thinking blocks
-        raw = re.sub(
-            r"<think>.*?</think>",
-            "",
-            raw,
-            flags=re.DOTALL
-        ).strip()
-        # Strip markdown code fences if present
-        raw = re.sub(r'^```(?:json)?\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw)
-        models_data = json.loads(raw)
-        if isinstance(models_data, dict):
-            models_data = [models_data]
-        logger.info(f"LLM identified {len(models_data)} model(s)")
-        return models_data
-    except json.JSONDecodeError as e:
-        logger.warning(f"LLM returned non-JSON response: {e}")
-        print("\n===== RAW LLM RESPONSE =====")
-        print(raw)
-        print("===========================\n")
-        return []
-    except Exception as e:
-        logger.warning(f"LLM model identification failed: {e}")
-        return []
+
+    def _make_prompt(cands_json: str) -> str:
+        return (
+            f'You are an OEM datasheet extraction engine for vendor "{vendor}".\n'
+            f"Return ONLY a JSON array. No preamble, no markdown, no code fences.\n"
+            f"{context_block}"
+            f"CANDIDATES: {cands_json}\n\n"
+            f"Keep only genuine product model/SKU strings. "
+            f"Output schema: "
+            f'[{{"model_name":"<exact string>","product_family":"<family or null>"}}]'
+            f"\nIf none qualify, return []. JSON ONLY."
+        )
+
+    for attempt in range(2):
+        try:
+            raw = llm.generate(_make_prompt(candidate_json), temperature=0, max_tokens=2000)
+            data = _parse_llm_json(raw, candidate_set)
+
+            if data is not None:        # parsed successfully (even if empty list)
+                logger.info(
+                    f"[model_id] LLM filtered {len(candidates)} candidates → "
+                    f"{len(data)} confirmed model(s)"
+                    + (f" (attempt {attempt + 1})" if attempt else "")
+                )
+                return data
+
+            if attempt == 0:
+                logger.debug("[model_id] LLM attempt 1 returned unparseable output — retrying")
+
+        except json.JSONDecodeError as exc:
+            if attempt == 0:
+                logger.debug(f"[model_id] LLM attempt 1 JSON error: {exc} — retrying")
+            else:
+                logger.warning(f"[model_id] LLM returned non-JSON on both attempts: {exc}")
+                return None
+        except Exception as exc:
+            logger.warning(f"[model_id] LLM call failed: {exc}")
+            return None
+
+    logger.warning("[model_id] LLM filtering failed after 2 attempts — skipping")
+    return None
 
 
-# ─── Master Model Identification ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Master function
+# ---------------------------------------------------------------------------
 
 def identify_models(
     pages: List[dict],
@@ -504,127 +580,336 @@ def identify_models(
     cfg: PipelineConfig,
 ) -> List[ModelSpec]:
     """
-    Master function: identify all models in a parsed document.
+    Master entry point.  Returns a list of ModelSpec, one per distinct SKU.
 
-    Strategy (in order of priority):
-    1. LLM-based identification (most accurate, requires API key)
-    2. Table-based extraction (structured data)
-    3. Regex pattern matching on full text (fallback)
-    4. Single-model fallback (whole doc = one model)
+    Strategy order:
+      1. Table-based extraction  – fast structural parsing
+      2. Regex candidate sweep   – pattern-match across full text
+      3. LLM filter (if enabled) – validate/prune the combined candidate list;
+                                   prompt contains only the candidate names,
+                                   NOT the raw document text
+      4. Single-model fallback   – whole doc = one product entry
+
+    The LLM is invoked AFTER parsing so it only needs to evaluate a short
+    list of candidate strings rather than thousands of tokens of raw text.
+    This keeps LLM latency and cost low while still catching edge cases that
+    pure regex might mis-classify.
     """
     full_text = "\n".join(p.get("cleaned_text", "") for p in pages)
     all_tables = [t for p in pages for t in p.get("tables", [])]
-    
     sections = split_into_sections(pages)
-    category, confidence = detect_category(
-                filename=filename,
-                full_text=full_text,
-        )
+
+    category, confidence = detect_category(filename=filename, full_text=full_text)
     models: List[ModelSpec] = []
 
-    # ── Strategy 1: LLM ────────────────────────────────────────────────────────
-    if cfg.use_llm_for_model_id:
-        llm_models = identify_models_with_llm(full_text, vendor, cfg, all_tables)
-        if llm_models:
-            for i, m in enumerate(llm_models):
-                raw_name = m.get("model_name", f"MODEL_{i+1}")
-                # Normalize: strip footnote markers that OCR/LLM may capture
-                model_name = _strip_annotation_markers(raw_name.strip())
-                spec = ModelSpec(
-                    model_id=_make_model_id(vendor, model_name, i),
-                    model_name=model_name,
-                    vendor=vendor,
-                    product_family=m.get("product_family"),
-                    product_category=category,
-                    category_confidence=confidence,
-                    description=m.get("description", ""),
-                    spec_sections=_flatten_key_specs(m.get("key_specs", {})),
-                    features=m.get("features", []),
-                    source_pages=list(range(1, len(pages) + 1)),
-                    extraction_confidence=0.9,
-                    identified_by="llm",
-                )
-                models.append(spec)
-            # ↑ _enrich called ONCE after ALL models are built, not inside loop
-            _enrich_models_with_sections(models, sections, full_text)
-            _assign_model_page_ranges(models, pages)
-            return models
-
-    # ── Strategy 2: Table-based ────────────────────────────────────────────────
+    # ── Stage 1: Table-based extraction ───────────────────────────────────
     table_models = extract_models_from_tables(all_tables, cfg.model_id)
-    if table_models:
-        seen = set()
-        for m in table_models:
-            mn = _strip_annotation_markers(m["model_name"].strip())
-            if mn in seen:
-                continue
-            seen.add(mn)
-            spec_text = _spec_row_to_text(m.get("spec_row", {}))
-            spec = ModelSpec(
+    table_specs: Dict[str, dict] = {}  # model_name → spec_row
+    table_names: List[str] = []
+    seen_table: Set[str] = set()
+    for m in table_models:
+        mn = _strip_annotation_markers(m["model_name"].strip())
+        if mn and mn not in seen_table:
+            seen_table.add(mn)
+            table_names.append(mn)
+            table_specs[mn] = m.get("spec_row", {})
+
+    logger.debug(f"[model_id] Table extraction: {len(table_names)} candidate(s)")
+
+    # ── Stage 2: Regex candidate sweep ────────────────────────────────────
+    regex_candidates = extract_candidate_model_numbers(full_text, cfg.model_id)
+    # Merge: table names take priority; add regex finds not already covered
+    all_candidate_names: List[str] = list(table_names)
+    seen_all: Set[str] = set(table_names)
+    for mn in list(regex_candidates.keys())[:20]:
+        mn = _strip_annotation_markers(mn.strip())
+        if mn and mn not in seen_all:
+            seen_all.add(mn)
+            all_candidate_names.append(mn)
+
+    logger.debug(
+        f"[model_id] Combined candidates after regex: {len(all_candidate_names)}"
+    )
+
+    # ── Stage 2b: Structural pruning (no LLM needed) ──────────────────────
+    # Three cheap passes before any LLM call:
+    #   1. Drop soft-suffix variants (ZTP/BDL/…) when base is present.
+    #   2. Drop tokens that are string-prefixes of longer candidates.
+    #   3. Drop tokens used overwhelmingly as "<name> Series" in the text.
+    all_candidate_names = _prune_soft_variant_suffixes(all_candidate_names)
+    all_candidate_names = _prune_family_prefixes(all_candidate_names)
+    all_candidate_names = _prune_series_names(all_candidate_names, full_text)
+    logger.debug(
+        f"[model_id] After structural pruning: {len(all_candidate_names)} candidate(s)"
+    )
+
+    # ── Stage 3: LLM filter (optional) ────────────────────────────────────
+    # Pass only the pruned candidate list to the LLM.
+    # filter_candidates_with_llm returns:
+    #   List[Dict]  → LLM responded; use the filtered list (may be empty).
+    #   None        → LLM failed entirely; keep all structurally-pruned candidates.
+    llm_confirmed: Optional[Dict[str, str]] = None  # model_name → product_family
+    if cfg.use_llm_for_model_id and all_candidate_names:
+        context_snippet = full_text[:800]
+        llm_data = filter_candidates_with_llm(
+            all_candidate_names, vendor, cfg, context_snippet
+        )
+        if llm_data is None:
+            # LLM failed — proceed with structurally-pruned candidates as-is.
+            logger.warning(
+                "[model_id] LLM filter unavailable — using structural pruning results"
+            )
+        else:
+            # LLM responded (even an empty list is authoritative).
+            llm_confirmed = {
+                d["model_name"].upper(): d.get("product_family")
+                for d in llm_data
+                if d.get("model_name")
+            }
+            all_candidate_names = [
+                n for n in all_candidate_names
+                if n.upper() in llm_confirmed
+            ]
+            logger.info(
+                f"[model_id] After LLM filter: {len(all_candidate_names)} model(s)"
+            )
+
+    # ── Build ModelSpec list from confirmed candidates ─────────────────────
+    if all_candidate_names:
+        for mn in all_candidate_names:
+            # Determine extraction confidence & method
+            if mn in seen_table:
+                conf_score = 0.85 if llm_confirmed is not None else 0.75
+                method = "table+llm_filter" if llm_confirmed is not None else "table"
+            else:
+                conf_score = 0.65 if llm_confirmed is not None else 0.5
+                method = "regex+llm_filter" if llm_confirmed is not None else "regex"
+
+            spec_text = _spec_row_to_text(table_specs.get(mn, {}))
+            family = (llm_confirmed or {}).get(mn.upper())
+
+            models.append(ModelSpec(
                 model_id=_make_model_id(vendor, mn, len(models)),
                 model_name=mn,
                 vendor=vendor,
-                spec_sections={"specifications": spec_text} if spec_text else {},
-                source_pages=list(range(1, len(pages) + 1)),
-                extraction_confidence=0.75,
+                product_family=family,
                 product_category=category,
                 category_confidence=confidence,
-                identified_by="table",
-            )
-            models.append(spec)
-
-        if models:
-            # Enrich with surrounding text
-            _enrich_models_with_sections(models, sections, full_text)
-            _assign_model_page_ranges(models, pages)
-            return models
-
-    # ── Strategy 3: Regex pattern matching ────────────────────────────────────
-    candidates = extract_candidate_model_numbers(full_text, cfg.model_id)
-    if candidates:
-        for mn, count in list(candidates.items())[:20]:  # Cap at 20
-            mn = _strip_annotation_markers(mn.strip())
-            spec = ModelSpec(
-                model_id=_make_model_id(vendor, mn, len(models)),
-                model_name=mn,
-                vendor=vendor,
+                spec_sections={"Specifications": spec_text} if spec_text else {},
                 source_pages=list(range(1, len(pages) + 1)),
-                extraction_confidence=0.5,
-                product_category=category,
-                category_confidence=confidence,
-                identified_by="regex",
-            )
-            models.append(spec)
-        _enrich_models_with_sections(models, sections, full_text)
-        _assign_model_page_ranges(models, pages)
+                extraction_confidence=conf_score,
+                identified_by=method,
+            ))
+
+        _enrich_models(models, sections, full_text, pages)
         return models
 
-    # ── Strategy 4: Single model fallback ─────────────────────────────────────
-    logger.info("No distinct models identified – treating as single-model document")
-    # Try to extract a model name from the document title or first heading
+    # ── Stage 4: Single-model fallback ────────────────────────────────────
+    logger.info("[model_id] No distinct models — treating as single-model doc")
     model_name = _guess_model_name(pages, vendor)
-    spec = ModelSpec(
+    models.append(ModelSpec(
         model_id=_make_model_id(vendor, model_name, 0),
         model_name=model_name,
         vendor=vendor,
         description=_extract_description(sections),
         spec_sections=_sections_to_spec_dict(sections),
-        spec_tables=[],
         source_pages=list(range(1, len(pages) + 1)),
         extraction_confidence=0.4,
         product_category=category,
         category_confidence=confidence,
         identified_by="fallback_single",
-    )
-    return [spec]
+    ))
+    return models
 
 
-# ─── Helper Functions ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Enrichment  (key fix for chunk explosion)
+# ---------------------------------------------------------------------------
+
+def _enrich_models(
+    models: List[ModelSpec],
+    sections: Dict[str, List[str]],
+    full_text: str,
+    pages: List[dict],
+) -> None:
+    """
+    Distribute document content to models.
+
+    Single model  → gets everything.
+    Multi-model   →
+      - Family sections (overview, features, certs …) go to models[0] ONLY.
+        The chunker emits these once tagged with the family / first model.
+      - Per-model context (paragraphs that explicitly mention the SKU) goes
+        to each model individually.
+      - Spec sections that mention a model go only to that model.
+      - Sections that mention NO known model go to all models (shared specs).
+    """
+    if len(models) == 1:
+        models[0].spec_sections = _sections_to_spec_dict(sections)
+        models[0].description = _extract_description(sections)
+        _assign_model_page_ranges(models, pages)
+        return
+
+    all_names = [m.model_name for m in models]
+    combined = _build_combined_pattern(all_names)
+    upper_to_name: Dict[str, str] = {n.upper(): n for n in all_names}
+    name_to_model: Dict[str, ModelSpec] = {m.model_name: m for m in models}
+
+    shared_desc = _extract_description(sections)
+
+    # Separate family vs spec sections
+    family_secs: Dict[str, str] = {}
+    spec_secs: Dict[str, str] = {}
+
+    for sec_name, lines in sections.items():
+        if sec_name == "_preamble":
+            continue
+        text = "\n".join(lines).strip()
+        if not text:
+            continue
+        if _is_family_section(sec_name):
+            family_secs[sec_name.title()] = text
+        else:
+            spec_secs[sec_name.title()] = text
+
+    # Family sections → models[0] only (chunker emits once)
+    for sec_name, sec_text in family_secs.items():
+        if sec_name not in models[0].spec_sections:
+            models[0].spec_sections[sec_name] = sec_text
+
+    # Shared description → all models (short, won't cause explosion)
+    for model in models:
+        if not model.description:
+            model.description = shared_desc
+
+    # Spec sections: scan once, distribute by model mention
+    for sec_name, sec_text in spec_secs.items():
+        found_upper = {m.upper() for m in combined.findall(sec_text)}
+        mentioned = {upper_to_name[u] for u in found_upper if u in upper_to_name}
+
+        if not mentioned:
+            # Untagged spec section → assign to all models (e.g. shared hardware)
+            for model in models:
+                if sec_name not in model.spec_sections:
+                    model.spec_sections[sec_name] = sec_text
+        else:
+            for mn in mentioned:
+                model = name_to_model.get(mn)
+                if model and sec_name not in model.spec_sections:
+                    model.spec_sections[sec_name] = sec_text
+
+    # Per-model context windows (paragraphs that mention the SKU by name)
+    paragraphs = re.split(r"\n{2,}", full_text)
+    for para in paragraphs:
+        para = para.strip()
+        if len(para) < 30:
+            continue
+        found_upper = {m.upper() for m in combined.findall(para)}
+        for u in found_upper:
+            mn = upper_to_name.get(u)
+            if not mn:
+                continue
+            model = name_to_model.get(mn)
+            if not model:
+                continue
+            existing = model.spec_sections.get("Model Context", "")
+            if len(existing) < 4000:
+                model.spec_sections["Model Context"] = (
+                    (existing + "\n\n" + para).strip()
+                    if existing else para
+                )
+
+    _assign_model_page_ranges(models, pages)
+
+
+# ---------------------------------------------------------------------------
+# Page range assignment + sub-module detection
+# ---------------------------------------------------------------------------
+
+_SUBMODULE_PATTERN = re.compile(
+    r'\b(F[A-Z]{2,3}-\d{4}[A-Z0-9\-]*)\b', re.IGNORECASE
+)
+_SUBMODULE_PREFIXES = ("FPM-", "FIM-", "SPM-", "FMC-", "FPC-", "FAP-")
+
+
+def _is_submodule_name(name: str) -> bool:
+    return any(name.upper().startswith(pfx) for pfx in _SUBMODULE_PREFIXES)
+
+
+def _assign_model_page_ranges(
+    models: List[ModelSpec],
+    pages: List[dict],
+) -> None:
+    """Narrow each model's source_pages to pages that actually mention it."""
+    if len(models) <= 1:
+        return
+
+    all_names = [m.model_name for m in models]
+    combined = _build_combined_pattern(all_names)
+    upper_map: Dict[str, str] = {n.upper(): n for n in all_names}
+
+    page_hits: List[Set[str]] = []
+    for page in pages:
+        text = page.get("cleaned_text", "")
+        found = {m.upper() for m in combined.findall(text)}
+        page_hits.append({upper_map[u] for u in found if u in upper_map})
+
+    for model in models:
+        hits = [idx + 1 for idx, s in enumerate(page_hits) if model.model_name in s]
+        if hits:
+            model.source_pages = list(range(min(hits), max(hits) + 1))
+        else:
+            logger.debug(f"[model_id] '{model.model_name}': no page hits, keeping all")
+
+    # Sub-module detection (FPM/FIM/etc.)
+    existing_upper = {m.model_name.upper() for m in models}
+    vendor = models[0].vendor if models else "Unknown"
+    category = models[0].product_category if models else "Unknown"
+    conf = models[0].category_confidence if models else 0.0
+    family = models[0].product_family if models else None
+
+    sub_hits: Dict[str, List[int]] = {}
+    for idx, page in enumerate(pages):
+        text = page.get("cleaned_text", "")
+        for match in _SUBMODULE_PATTERN.finditer(text):
+            cand = match.group(1).upper()
+            if cand in existing_upper or not _is_submodule_name(cand):
+                continue
+            sub_hits.setdefault(cand, []).append(idx + 1)
+
+    for sub_name, hit_pages in sub_hits.items():
+        first, last = min(hit_pages), max(hit_pages)
+        sub = ModelSpec(
+            model_id=_make_model_id(vendor, sub_name, len(models)),
+            model_name=sub_name,
+            vendor=vendor,
+            product_family=family,
+            product_category=category,
+            category_confidence=conf,
+            source_pages=list(range(first, last + 1)),
+            extraction_confidence=0.7,
+            identified_by="submodule_detection",
+        )
+        # Populate spec_sections from scoped pages only
+        scoped = [
+            p.get("cleaned_text", "").strip()
+            for p in pages
+            if p.get("page_number", 0) in sub.source_pages
+        ]
+        if scoped:
+            sub.spec_sections["Hardware Specifications"] = "\n\n".join(scoped)
+        models.append(sub)
+        logger.info(f"[model_id] Sub-module '{sub_name}' → pages {first}–{last}")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _make_model_id(vendor: str, model_name: str, idx: int) -> str:
-    vendor_slug = re.sub(r'\W+', '_', vendor.lower())[:15]
-    model_slug = re.sub(r'\W+', '_', model_name.upper())[:20]
-    return f"{vendor_slug}_{model_slug}_{idx}"
+    v = re.sub(r'\W+', '_', vendor.lower())[:15]
+    m = re.sub(r'\W+', '_', model_name.upper())[:20]
+    return f"{v}_{m}_{idx}"
 
 
 def _flatten_key_specs(key_specs: dict) -> Dict[str, str]:
@@ -636,303 +921,30 @@ def _spec_row_to_text(spec_row: dict) -> str:
 
 
 def _sections_to_spec_dict(sections: Dict[str, List[str]]) -> Dict[str, str]:
-    result = {}
-    for section_name, lines in sections.items():
-        if section_name == "_preamble":
-            continue
-        text = "\n".join(lines).strip()
-        if text:
-            result[section_name.title()] = text
-    return result
+    return {
+        sec.title(): "\n".join(lines).strip()
+        for sec, lines in sections.items()
+        if sec != "_preamble" and lines
+    }
 
 
 def _extract_description(sections: Dict[str, List[str]]) -> str:
-    for key in ["_preamble", "OVERVIEW", "INTRODUCTION", "DESCRIPTION"]:
+    for key in ("_preamble", "OVERVIEW", "INTRODUCTION", "DESCRIPTION"):
         if key in sections and sections[key]:
             return " ".join(sections[key])[:500]
     return ""
 
 
 def _guess_model_name(pages: List[dict], vendor: str) -> str:
-    """Try to extract a product name from early page text."""
     for page in pages[:2]:
-        text = page.get("cleaned_text", "")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        lines = [
+            ln.strip()
+            for ln in page.get("cleaned_text", "").splitlines()
+            if ln.strip()
+        ]
         for line in lines[:10]:
-            # Skip lines that are just the vendor name
             if vendor.lower() in line.lower() and len(line.split()) <= 3:
                 continue
             if 3 <= len(line.split()) <= 8:
                 return line[:80]
     return f"{vendor} Product"
-
-
-def _enrich_models_with_sections(
-    models: List[ModelSpec],
-    sections: Dict[str, List[str]],
-    full_text: str,
-) -> None:
-    """
-    Distribute document sections and text context to each model's spec_sections.
-
-    Single model  → entire document goes to it.
-    Multi-model   → three-pass strategy:
-        Pass 1: shared sections (apply to ALL models — avoids blank models)
-        Pass 2: per-model context windows (text immediately around model name)
-        Pass 3: common_specs already populated by _split_comparison_table
-                — these flow through to chunker automatically, nothing to do here.
-    """
-    # ── Single model: everything belongs to it ────────────────────────────────
-    if len(models) == 1:
-        models[0].spec_sections = _sections_to_spec_dict(sections)
-        models[0].description = _extract_description(sections)
-        return
-
-    # ── Multi-model ───────────────────────────────────────────────────────────
-
-    # Sections that contain specs shared across the whole product family.
-    # These are copied verbatim to every model so each model is self-contained
-    # in the vector DB (an embedder querying "PA-3250 throughput" should find it
-    # even if the value lives in a shared section).
-    SHARED_SECTION_KEYWORDS = {
-        "overview", "introduction", "description", "features", "key features",
-        "certifications", "compliance", "regulatory", "standards",
-        "ordering information", "ordering", "part number",
-        "environmental", "operating conditions", "safety",
-        "warranty", "support",
-    }
-
-    shared_sections: Dict[str, str] = {}
-    spec_sections:   Dict[str, str] = {}  # likely model-specific
-
-    for section_name, lines in sections.items():
-        if section_name == "_preamble":
-            continue
-        text = "\n".join(lines).strip()
-        if not text:
-            continue
-        key = section_name.lower()
-        if any(kw in key for kw in SHARED_SECTION_KEYWORDS):
-            shared_sections[section_name.title()] = text
-        else:
-            spec_sections[section_name.title()] = text
-
-    # Shared description (from preamble / overview)
-    shared_description = _extract_description(sections)
-
-    # ── Pass 1: give every model the shared sections + description ────────────
-    for model in models:
-        model.description = model.description or shared_description
-        # Seed spec_sections with shared content; per-model content added below
-        for sec_name, sec_text in shared_sections.items():
-            if sec_name not in model.spec_sections:
-                model.spec_sections[sec_name] = sec_text
-
-    # ── Pass 2: per-model context extraction ─────────────────────────────────
-    # Build ONE combined pattern for all model names once, then scan each
-    # paragraph / section a single time to find which models appear in it.
-    # Previously: M models × P paragraphs × re.search  +  M×S×M re.search
-    # Now:        P findall  +  S findall  +  dict lookups  (20-30× faster)
-    all_model_names = [m.model_name for m in models]
-    combined = _build_combined_pattern(all_model_names)
-    # Normalise to uppercase for fast set membership tests
-    name_upper_to_original: Dict[str, str] = {n.upper(): n for n in all_model_names}
-
-    # 2a. Paragraph scan: collect blocks mentioning each model
-    paragraphs = re.split(r"\n{2,}", full_text)
-    model_context_blocks: Dict[str, List[str]] = {m.model_name: [] for m in models}
-    for para in paragraphs:
-        para_stripped = para.strip()
-        if len(para_stripped) <= 20:
-            continue
-        found_upper = {match.upper() for match in combined.findall(para_stripped)}
-        for upper, original in name_upper_to_original.items():
-            if upper in found_upper:
-                model_context_blocks[original].append(para_stripped)
-
-    for model in models:
-        blocks = model_context_blocks[model.model_name]
-        if blocks:
-            model.spec_sections["Model Context"] = "\n\n".join(blocks)[:4000]
-
-    # 2b. Spec section distribution: scan each section ONCE, record which
-    # models it mentions, then distribute via dict lookups — no per-section
-    # per-model regex any more.
-    section_mentioned: Dict[str, set] = {}
-    for sec_name, sec_text in spec_sections.items():
-        found_upper = {match.upper() for match in combined.findall(sec_text)}
-        section_mentioned[sec_name] = {
-            name_upper_to_original[u]
-            for u in found_upper
-            if u in name_upper_to_original
-        }
-
-    for model in models:
-        for sec_name, sec_text in spec_sections.items():
-            if sec_name in model.spec_sections:
-                continue
-            mentioned = section_mentioned[sec_name]
-            # Skip if the section explicitly names other models but not this one
-            if mentioned and model.model_name not in mentioned:
-                continue
-            model.spec_sections[sec_name] = sec_text
-
-    # ── Pass 3: log summary ────────────────────────────────────────────────────
-    for model in models:
-        logger.debug(
-            f"  Enriched '{model.model_name}': "
-            f"{len(model.spec_sections)} sections, "
-            f"{len(model.specs)} model-specs, "
-            f"{len(model.common_specs)} common-specs, "
-            f"{len(model.features)} features"
-        )
-
-
-# ─── Page Range Assignment ────────────────────────────────────────────────────────
-
-# Sub-module SKU patterns for components like FPM/FIM/SPM that live in the same
-# datasheet as the chassis models but have their own spec tables.
-_SUBMODULE_PATTERN = re.compile(
-    r'\b(F[A-Z]{2,3}-\d{4}[A-Z0-9\-]*)\b',
-    re.IGNORECASE,
-)
-
-_KNOWN_SUBMODULE_PREFIXES = ("FPM-", "FIM-", "SPM-", "FMC-", "FPC-", "FAP-")
-
-
-def _is_submodule_name(name: str) -> bool:
-    """Return True for chassis sub-module SKUs (e.g. FPM-7620F, FIM-7921F)."""
-    upper = name.upper()
-    return any(upper.startswith(pfx) for pfx in _KNOWN_SUBMODULE_PREFIXES)
-
-
-def _assign_model_page_ranges(
-    models: List[ModelSpec],
-    pages: List[dict],
-) -> None:
-    """
-    Replace the coarse 'all pages' source_pages with the actual pages that
-    contain each model's name, then tighten to a contiguous page range.
-
-    Algorithm
-    ---------
-    1. For each page, record which model names appear in its text.
-    2. For each model, collect all pages that mention it.
-    3. Expand to contiguous range (first_mention..last_mention) so that
-       spec tables on intermediate pages are included.
-    4. Single-model documents keep all pages (no change).
-    5. Models with zero page hits keep all pages as a safe fallback.
-
-    Sub-module detection
-    --------------------
-    After assigning page ranges to the primary chassis models, scan every page
-    for sub-module SKUs (FPM-*, FIM-*, …) that were *not* already in the model
-    list and synthesise lightweight ModelSpec entries for them so they get their
-    own chunks in the vector DB.
-    """
-    if len(models) <= 1:
-        # Nothing to narrow; single-model docs own the whole document.
-        return
-
-    total_pages = len(pages)
-
-    # Build a combined OR-pattern for all model names once and scan each page
-    # a single time.  Previously: M models × P pages × re.search per page.
-    # Now: P findall calls + dict lookups.
-    all_names = [m.model_name for m in models]
-    combined = _build_combined_pattern(all_names)
-    name_upper_map: Dict[str, str] = {n.upper(): n for n in all_names}
-
-    page_model_hits: List[set] = [set() for _ in range(total_pages)]
-    for page_idx, page in enumerate(pages):
-        text = page.get("cleaned_text", "")
-        found_upper = {match.upper() for match in combined.findall(text)}
-        page_model_hits[page_idx] = {
-            name_upper_map[u] for u in found_upper if u in name_upper_map
-        }
-
-    for model in models:
-        hit_pages = [
-            idx + 1  # 1-indexed page number
-            for idx, hits in enumerate(page_model_hits)
-            if model.model_name in hits
-        ]
-        if not hit_pages:
-            # Fallback: keep all pages (shared overview / ordering section)
-            logger.debug(
-                f"  [page_ranges] '{model.model_name}' had no page hits – keeping all pages"
-            )
-            continue
-
-        first_page = min(hit_pages)
-        last_page = max(hit_pages)
-        # Contiguous range so intermediate spec-table pages are captured
-        model.source_pages = list(range(first_page, last_page + 1))
-        logger.debug(
-            f"  [page_ranges] '{model.model_name}' → pages {first_page}–{last_page}"
-        )
-
-    # ── Sub-module detection ──────────────────────────────────────────────────
-    existing_names = {m.model_name.upper() for m in models}
-    vendor = models[0].vendor if models else "Unknown"
-    category = models[0].product_category if models else "Unknown"
-    confidence = models[0].category_confidence if models else 0.0
-    product_family = models[0].product_family if models else None
-
-    submodule_page_hits: Dict[str, List[int]] = {}
-    for page_idx, page in enumerate(pages):
-        text = page.get("cleaned_text", "")
-        for match in _SUBMODULE_PATTERN.finditer(text):
-            candidate = match.group(1).upper()
-            if candidate in existing_names:
-                continue
-            if not _is_submodule_name(candidate):
-                continue
-            submodule_page_hits.setdefault(candidate, []).append(page_idx + 1)
-
-    for sub_name, hit_pages in submodule_page_hits.items():
-        first_page = min(hit_pages)
-        last_page = max(hit_pages)
-        sub_spec = ModelSpec(
-            model_id=_make_model_id(vendor, sub_name, len(models) + len(submodule_page_hits)),
-            model_name=sub_name,
-            vendor=vendor,
-            product_family=product_family,
-            product_category=category,
-            category_confidence=confidence,
-            source_pages=list(range(first_page, last_page + 1)),
-            extraction_confidence=0.7,
-            identified_by="submodule_detection",
-        )
-        models.append(sub_spec)
-        logger.info(
-            f"  [page_ranges] Sub-module detected: '{sub_name}' → "
-            f"pages {first_page}–{last_page}"
-        )
-
-    # Enrich the newly appended sub-modules with page-scoped text sections
-    new_submodules = [m for m in models if m.identified_by == "submodule_detection"]
-    if new_submodules:
-        _enrich_submodules_with_page_text(new_submodules, pages)
-
-
-def _enrich_submodules_with_page_text(
-    submodules: List[ModelSpec],
-    pages: List[dict],
-) -> None:
-    """Populate spec_sections for sub-module entries using their scoped pages."""
-    for sub in submodules:
-        scoped_text_parts = []
-        for page in pages:
-            pnum = page.get("page_number", 0)
-            if pnum in sub.source_pages:
-                text = page.get("cleaned_text", "").strip()
-                if text:
-                    scoped_text_parts.append(text)
-
-        if scoped_text_parts:
-            sub.spec_sections["Hardware Specifications"] = "\n\n".join(scoped_text_parts)
-            logger.debug(
-                f"  [submodule_enrich] '{sub.model_name}' "
-                f"spec_sections populated from {len(scoped_text_parts)} page(s)"
-            )

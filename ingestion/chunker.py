@@ -2,20 +2,33 @@
 OEM Datasheet Ingestion Pipeline - Smart Chunking
 Converts ModelSpec objects into DocumentChunk objects ready for embedding.
 
-Chunking strategy:
-  1. Spec tables → flat key:value text chunks (one chunk per table or per model row)
-  2. Named specification sections → dedicated chunks per section
-  3. Features list → one compact chunk
-  4. General description → one chunk
-  5. Structured per-model specs -> dedicated searchable spec chunks
-  6. Long sections are split with overlap using a recursive text splitter
+Chunking strategy (one chunk per logical unit, no duplication):
+  1.  Document-level description  → 1 chunk (shared across all models)
+  2.  Shared spec sections         → 1 chunk per section (tagged with family)
+  3.  Per-model comparison specs   → 1 dense chunk per model (all specs together)
+  4.  Per-model spec tables        → 1 chunk per table (flat key:value)
+  5.  Per-model features           → 1 chunk
+  6.  Ordering info                → 1 chunk per section
+
+Design principles
+-----------------
+- Sections that belong to every model in a family (features, overview,
+  certifications, ordering info) are emitted ONCE under the product family,
+  not repeated N times for N models.  This is the main cause of chunk
+  explosion in the original code.
+- Per-model data (throughput, interface count, etc.) is merged into a single
+  dense "spec profile" chunk per model instead of splitting small text blocks
+  at 300-char boundaries.
+- Chunk sizes are tuned to real spec content: min 150 chars, target 800 chars,
+  hard max 1400 chars.  Overlap is 0 for spec chunks (key:value rows are
+  self-contained); a small overlap is kept only for prose descriptions.
 """
 from __future__ import annotations
 
 import hashlib
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -29,20 +42,16 @@ from models.schemas import (
 )
 
 
-# ─── Section → ChunkType Mapping ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Section → ChunkType mapping
+# ---------------------------------------------------------------------------
 
-_SECTION_CHUNK_TYPE_MAP = {
-    # Spec tables / technical spec sections
+_SECTION_CHUNK_TYPE_MAP: Dict[str, ChunkType] = {
     "specifications": ChunkType.SPEC_TEXT,
     "technical specifications": ChunkType.SPEC_TEXT,
-    "spec": ChunkType.SPEC_TEXT,
     "hardware specifications": ChunkType.SPEC_TABLE,
-    "specifications hardware features": ChunkType.SPEC_TABLE,
-    "system performance and capacity": ChunkType.SPEC_TABLE,
-    "system performance": ChunkType.SPEC_TABLE,
-    "hardware features": ChunkType.SPEC_TABLE,
-    "system specifications": ChunkType.SPEC_TEXT,
-    "product specifications": ChunkType.SPEC_TEXT,
+    "system performance and capacity": ChunkType.PERFORMANCE,
+    "system performance": ChunkType.PERFORMANCE,
     "performance": ChunkType.PERFORMANCE,
     "throughput": ChunkType.PERFORMANCE,
     "capacity": ChunkType.PERFORMANCE,
@@ -69,53 +78,22 @@ _SECTION_CHUNK_TYPE_MAP = {
     "operating conditions": ChunkType.ENVIRONMENTAL,
 }
 
-# ─── Canonical Section Name Normalization ──────────────────────────────────────
-# Maps garbled OCR section names (usually PDF table column headers captured as
-# section titles) to human-readable canonical names used in chunk metadata.
-# The keys are lowercased and stripped before lookup.
-
-_CANONICAL_SECTION_NAMES: Dict[str, str] = {
-    # FortiGate 7000F series — garbled two-column spec table headers
-    "fg-7081f-dc fg-7081f-2-dc fg-7081f-dc fg-7081f-2-dc": "System Performance and Capacity",
-    "fg-7121f* fg-7121f-2-dc fg-7121f* fg-7121f-2-dc": "System Performance and Capacity",
-    "fg-7121f-dc fg-7121f-2-dc": "System Performance and Capacity",
-    "152a@48v 154a@48v": "Power Specifications",
-    "174@48v /": "Power Specifications",
-    "127@48v / 152a@48v": "Power Specifications",
-    "power console": "Hardware Interfaces",
-    "secure module module secure": "Hardware Interfaces",
-    "np7 tpm 400/100/40/25/10/ge 8tb": "Hardware Features",
-    "np7 cp9 tpm 100/40/25/10/ge": "Hardware Features",
-    "service enterprise unified threat advanced threat": "Subscription Bundles",
-    "malicious certificate": "Web/DNS Security",
-    "outbreak check": "Attack Surface Security",
-    "fortitelemetry cloud": "SD-WAN and SASE Services",
-    "fortianalyzer cloud": "NOC and SOC Services",
-    "hardware forticare essentials desktop": "FortiCare Services",
-    "forticare elite": "FortiCare Services",
-    "hardware model": "Ordering Information",
-    "processor module": "Ordering Information",
-    "40 ge qsfp+ 400 ge qsfp-dd": "Interface Specifications",
-    # Generic patterns for other garbled headers
-    "to deliver:": "Key Capabilities",
-}
+# Sections that describe the whole family/product line, not a single SKU.
+# These are emitted once under the family name rather than once per model.
+_FAMILY_LEVEL_SECTION_KEYWORDS: FrozenSet[str] = frozenset({
+    "overview", "introduction", "description",
+    "features", "key features", "product features", "highlights",
+    "certifications", "compliance", "regulatory", "standards",
+    "ordering", "ordering information", "part number", "sku",
+    "environmental", "operating conditions",
+    "warranty", "support", "services",
+    "use cases", "solution overview",
+})
 
 
-def _canonicalize_section_name(section_name: str) -> str:
-    """Return a clean, human-readable section name.
-
-    Tries an exact lowercased lookup first, then a substring scan for known
-    garbled prefixes.  Falls back to title-casing the original name.
-    """
+def _is_family_level_section(section_name: str) -> bool:
     key = section_name.lower().strip()
-    if key in _CANONICAL_SECTION_NAMES:
-        return _CANONICAL_SECTION_NAMES[key]
-    # Substring scan: if the garbled key starts with a known prefix keep it
-    for garbled, canonical in _CANONICAL_SECTION_NAMES.items():
-        if key.startswith(garbled[:20]):
-            return canonical
-    # Default: apply title-case to make at least cosmetically readable
-    return section_name.title()
+    return any(kw in key for kw in _FAMILY_LEVEL_SECTION_KEYWORDS)
 
 
 def _section_to_chunk_type(section_name: str) -> ChunkType:
@@ -126,332 +104,396 @@ def _section_to_chunk_type(section_name: str) -> ChunkType:
     return ChunkType.GENERAL
 
 
-# ─── Unicode / Encoding Fixes ────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Text utilities
+# ---------------------------------------------------------------------------
 
-# pdfplumber on some PDFs strips the μ (U+03BC, micro sign) or replaces it with
-# a plain ASCII "u".  This mapping restores the most common unit occurrences seen
-# in networking/power datasheets so spec values like "7.5 μs" are stored correctly.
 _UNICODE_REPAIRS = [
-    # "7.5 s" or "7.50 s" with a space — must be latency, not seconds
     (re.compile(r'(\d+\.?\d*)\s+s\b(?!\s*[/A-Za-z])'), r'\1 μs'),
-    # Explicit replacement for pdfplumber's known lossy substitution
-    (re.compile(r'\bus\b(?=\s*\()'), 'μs'),   # e.g. "7.5 us (latency)"
+    (re.compile(r'\bus\b(?=\s*\()'), 'μs'),
 ]
 
 
 def _fix_unicode(text: str) -> str:
-    """Repair known Unicode losses introduced by PDF text extraction."""
     for pattern, replacement in _UNICODE_REPAIRS:
         text = pattern.sub(replacement, text)
     return text
 
 
-
-
 def _dedup_lines(text: str) -> str:
-    """Remove consecutive duplicate lines produced by multi-column PDF extraction.
-
-    Two-column spec tables extracted by pdfplumber often emit each line twice
-    because the left and right columns of the same row are concatenated without
-    deduplication.  This function removes immediately repeated non-empty lines
-    while preserving intentional repetition (e.g. two different spec rows that
-    happen to share a value).
-
-    Strategy: scan the line list and drop line[i] if it is identical to
-    line[i-1] (after stripping).  This is conservative — it only removes
-    back-to-back duplicates, not all duplicates.
-    """
+    """Remove consecutive duplicate lines (pdfplumber two-column artefact)."""
     lines = text.split("\n")
-    deduped: List[str] = []
-    prev_stripped = None
+    out: List[str] = []
+    prev = None
     for line in lines:
-        stripped = line.strip()
-        if stripped and stripped == prev_stripped:
-            # Skip exact consecutive duplicate (empty lines are allowed to repeat)
+        s = line.strip()
+        if s and s == prev:
             continue
-        deduped.append(line)
-        if stripped:
-            prev_stripped = stripped
-        # Reset on blank lines so blank-line-separated sections don't cross-suppress
-        else:
-            prev_stripped = None
-    return "\n".join(deduped)
+        out.append(line)
+        prev = s if s else None
+    return "\n".join(out)
 
 
-# ─── Text Splitter ────────────────────────────────────────────────────────────────
+def _clean_text(text: str) -> str:
+    text = _fix_unicode(text)
+    text = _dedup_lines(text)
+    # Collapse runs of blank lines to a single blank line
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
-def _split_text(
-    text: str,
-    chunk_size: int,
-    overlap: int,
-    separators: Optional[List[str]] = None,
-) -> List[str]:
+
+def _split_text(text: str, max_size: int, overlap: int = 0) -> List[str]:
     """
-    A simple recursive text splitter.
-    Tries to split on paragraphs, then newlines, then sentences, then words.
-    """
-    if len(text) <= chunk_size:
-        return [text.strip()] if text.strip() else []
+    Split *text* into chunks of at most *max_size* characters.
 
-    separators = separators or ["\n\n", "\n", ". ", " "]
-    for sep in separators:
-        if sep in text:
-            parts = text.split(sep)
-            chunks = []
-            current = ""
-            for part in parts:
-                candidate = (current + sep + part).strip() if current else part.strip()
-                if len(candidate) <= chunk_size:
-                    current = candidate
+    Tries natural break points in order:
+      paragraph → newline → sentence boundary → word boundary → hard cut.
+
+    Overlap is added as complete lines only (no mid-line slicing).
+    Returns a list of non-empty stripped strings.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_size:
+        return [text]
+
+    for sep in ("\n\n", "\n", ". ", " "):
+        if sep not in text:
+            continue
+        parts = text.split(sep)
+        chunks: List[str] = []
+        current = ""
+        for part in parts:
+            joined = (current + sep + part).strip() if current else part.strip()
+            if len(joined) <= max_size:
+                current = joined
+            else:
+                if current:
+                    chunks.append(current)
+                if len(part) > max_size:
+                    # Recurse on oversized piece with remaining separators
+                    sub = _split_text(part, max_size, overlap)
+                    chunks.extend(sub[:-1])
+                    current = sub[-1] if sub else ""
                 else:
-                    if current:
-                        chunks.append(current)
-                    # If single part > chunk_size, recurse with next separator
-                    if len(part) > chunk_size:
-                        sub_chunks = _split_text(part, chunk_size, overlap, separators[1:])
-                        chunks.extend(sub_chunks)
-                        current = ""
-                    else:
-                        current = part.strip()
-            if current:
-                chunks.append(current)
+                    current = part.strip()
+        if current:
+            chunks.append(current)
 
-            # Apply overlap: take the last N *complete lines* of the previous
-            # chunk as carry-over context, not a raw character slice.
-            # Raw character slicing (the previous approach) caused mangled
-            # partial-line prefixes that pdfplumber reproduced verbatim —
-            # producing the "line repeated twice" pattern seen in the DB.
-            if overlap > 0 and len(chunks) > 1:
-                overlapped = [chunks[0]]
-                for i in range(1, len(chunks)):
-                    prev = overlapped[-1]
-                    # Collect complete lines from the tail of the previous chunk
-                    # until we reach the overlap budget.
-                    prev_lines = prev.splitlines()
-                    carry_lines: List[str] = []
-                    carry_len = 0
-                    for line in reversed(prev_lines):
-                        line_len = len(line) + 1  # +1 for the newline
-                        if carry_len + line_len > overlap and carry_lines:
-                            break
-                        carry_lines.insert(0, line)
-                        carry_len += line_len
-                    carry = "\n".join(carry_lines).strip()
-                    if carry:
-                        overlapped.append(carry + "\n" + chunks[i])
-                    else:
-                        overlapped.append(chunks[i])
-                return [c.strip() for c in overlapped if c.strip()]
-            return [c.strip() for c in chunks if c.strip()]
+        if not chunks:
+            continue
 
-    # Last resort: hard split by character count
-    return [text[i:i+chunk_size].strip()
-            for i in range(0, len(text), chunk_size - overlap)
-            if text[i:i+chunk_size].strip()]
+        # Apply line-based overlap
+        if overlap > 0 and len(chunks) > 1:
+            overlapped = [chunks[0]]
+            for i in range(1, len(chunks)):
+                prev_lines = overlapped[-1].splitlines()
+                carry: List[str] = []
+                used = 0
+                for ln in reversed(prev_lines):
+                    cost = len(ln) + 1
+                    if used + cost > overlap and carry:
+                        break
+                    carry.insert(0, ln)
+                    used += cost
+                prefix = "\n".join(carry).strip()
+                overlapped.append((prefix + "\n" + chunks[i]).strip() if prefix else chunks[i])
+            return [c for c in overlapped if c]
+
+        return [c for c in chunks if c]
+
+    # Hard cut
+    return [
+        text[i: i + max_size].strip()
+        for i in range(0, len(text), max(1, max_size - overlap))
+        if text[i: i + max_size].strip()
+    ]
 
 
-# ─── Chunk ID Generation ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Chunk ID
+# ---------------------------------------------------------------------------
 
-def _make_chunk_id(doc_id: str, model_id: str, section: str, index: int) -> str:
-    key = f"{doc_id}::{model_id}::{section}::{index}"
+def _chunk_id(doc_id: str, model_id: str, tag: str, index: int = 0) -> str:
+    key = f"{doc_id}|{model_id}|{tag}|{index}"
     h = hashlib.md5(key.encode()).hexdigest()[:12]
-    return f"chunk_{h}"
+    return f"ck_{h}"
 
 
-# ─── Main Chunking Functions ─────────────────────────────────────────────────────
-
-def chunk_model_spec(
-    model: ModelSpec,
-    doc: DatasheetDocument,
-    cfg: ChunkingConfig,
-) -> List[DocumentChunk]:
-    """
-    Convert a ModelSpec into a list of DocumentChunks ready for embedding.
-    Each chunk carries rich metadata for downstream filtering.
-    """
-    chunks: List[DocumentChunk] = []
-    created_at = datetime.now(timezone.utc).isoformat()
-
-    def make_chunk(
-        text: str,
-        chunk_type: ChunkType,
-        section_name: str = "",
-        table_index: Optional[int] = None,
-        chunk_index: int = 0,
-    ) -> DocumentChunk:
-        cid = _make_chunk_id(
-            doc.doc_id, model.model_id,
-            f"{section_name}_{chunk_type.value}", chunk_index
-        )
-        # Use the model's narrowed source_pages (set by _assign_model_page_ranges)
-        # rather than always defaulting to page 1 of the full document.
-        _pages = model.source_pages or []
-        return DocumentChunk(
-            chunk_id=cid,
-            text=text,
-            doc_id=doc.doc_id,
-            vendor=model.vendor,
-            model_name=model.model_name,
-            model_id=model.model_id,
-            product_family=model.product_family,
-            product_category=model.product_category,
-            chunk_type=chunk_type,
-            section_name=section_name,
-            source_file=doc.source_path,
-            source_pages=_pages,
-            page_start=_pages[0] if _pages else None,
-            page_end=_pages[-1] if _pages else None,
-            table_index=table_index,
-            extraction_method=doc.extraction_method.value,
-            pipeline_version=doc.pipeline_version,
-            created_at=created_at,
-        )
-
-    # ── 1. Description chunk ───────────────────────────────────────────────────
-    if model.description.strip():
-        desc_header = (
-            f"Vendor: {model.vendor}\n"
-            f"Model: {model.model_name}\n"
-            + (f"Product Family: {model.product_family}\n" if model.product_family else "")
-            + (f"Category: {model.product_category}\n" if model.product_category else "")
-            + f"\nDescription:\n{model.description}"
-        )
-        for i, chunk_text in enumerate(
-            _split_text(desc_header, cfg.general_chunk_size, cfg.general_chunk_overlap)
-        ):
-            chunks.append(make_chunk(chunk_text, ChunkType.DESCRIPTION, "description", chunk_index=i))
-
-    # ── 2. Features chunk ─────────────────────────────────────────────────────
-    if model.features:
-        feature_text = (
-            f"Vendor: {model.vendor} | Model: {model.model_name}\n"
-            f"Key Features:\n" + "\n".join(f"• {f}" for f in model.features)
-        )
-        for i, chunk_text in enumerate(
-            _split_text(feature_text, cfg.spec_chunk_size, cfg.spec_chunk_overlap)
-        ):
-            chunks.append(make_chunk(chunk_text, ChunkType.FEATURES, "features", chunk_index=i))
-
-    # ── 3. Named specification sections ───────────────────────────────────────
-    for section_name, section_text in model.spec_sections.items():
-        if not section_text.strip():
-            continue
-
-        # Normalize garbled OCR section names to canonical human-readable names
-        canonical_name = _canonicalize_section_name(section_name)
-        chunk_type = _section_to_chunk_type(canonical_name)
-
-        # Repair encoding losses (e.g. μ stripped to bare "s") then deduplicate
-        clean_section_text = _dedup_lines(_fix_unicode(section_text))
-
-        # Build a context header for each chunk so it's self-contained
-        header = (
-            f"Vendor: {model.vendor} | Model: {model.model_name}"
-            + (f" | Family: {model.product_family}" if model.product_family else "")
-            + f"\nSection: {canonical_name}\n\n"
-        )
-
-        full_section_text = header + clean_section_text
-
-        # Tables get their own size budget; specs get the spec budget
-        if chunk_type == ChunkType.SPEC_TABLE:
-            size, overlap = cfg.table_chunk_size, cfg.table_chunk_overlap
-        else:
-            size, overlap = cfg.spec_chunk_size, cfg.spec_chunk_overlap
-
-        sub_chunks = _split_text(full_section_text, size, overlap)
-        for i, chunk_text in enumerate(sub_chunks):
-            chunks.append(
-                make_chunk(chunk_text, chunk_type, canonical_name, chunk_index=i)
-            )
-
-    # ── 4. Spec tables ────────────────────────────────────────────────────────
-    for tidx, table in enumerate(model.spec_tables):
-        # Prefer flat key:value text for spec tables (better semantic search)
-        flat = table.to_flat_text()
-        md = table.to_markdown()
-
-        # Use whichever is longer (more information)
-        table_text_raw = flat if len(flat) > len(md) else md
-        if not table_text_raw.strip():
-            continue
-
-        header = (
-            f"Vendor: {model.vendor} | Model: {model.model_name}"
-            + (f" | Family: {model.product_family}" if model.product_family else "")
-            + f"\nSpecification Table {tidx+1} (Page {table.page_number}):\n\n"
-        )
-        table_text = header + table_text_raw
-
-        sub_chunks = _split_text(table_text, cfg.table_chunk_size, cfg.table_chunk_overlap)
-        for i, chunk_text in enumerate(sub_chunks):
-            chunks.append(
-                make_chunk(chunk_text, ChunkType.SPEC_TABLE, f"table_{tidx}", tidx, chunk_index=i)
-            )
-
-    # ── 5. Structured specs from split comparison tables ───────────────────────
-    if model.specs or model.common_specs:
-        lines = [f"Vendor: {model.vendor} | Model: {model.model_name}"]
-        if model.product_family:
-            lines[0] += f" | Family: {model.product_family}"
-
-        if model.specs:
-            lines.append("Specifications:")
-            lines.extend(f"{key}: {value}" for key, value in model.specs.items())
-
-        if model.common_specs:
-            lines.append("Common Specifications:")
-            lines.extend(f"{key}: {value}" for key, value in model.common_specs.items())
-
-        specs_text = _fix_unicode("\n".join(lines))
-        for i, chunk_text in enumerate(
-            _split_text(specs_text, cfg.spec_chunk_size, cfg.spec_chunk_overlap)
-        ):
-            chunks.append(
-                make_chunk(chunk_text, ChunkType.SPEC_TEXT, "structured_specs", chunk_index=i)
-            )
-
-    # ── 6. Ordering information ────────────────────────────────────────────────
-    # If there's ordering/part-number info in the spec_sections, we already
-    # handled it in step 3. This step handles any extra ordering fields.
-
-    logger.debug(
-        f"Model '{model.model_name}' → {len(chunks)} chunks"
-    )
-    return chunks
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def chunk_document(
     doc: DatasheetDocument,
     cfg: ChunkingConfig,
 ) -> List[DocumentChunk]:
     """
-    Chunk all models in a DatasheetDocument.
-    Returns flat list of all DocumentChunks.
-    """
-    all_chunks: List[DocumentChunk] = []
+    Convert a fully-parsed DatasheetDocument into a flat list of
+    DocumentChunk objects ready for embedding and vector-store insertion.
 
+    The function avoids the chunk-explosion problem by:
+      1. Emitting family-level sections ONCE, shared across all models.
+      2. Merging all per-model key:value specs into one dense chunk.
+      3. Using larger chunk budgets that match real spec content size.
+    """
     if not doc.models:
-        logger.warning(f"Document {doc.filename} has no models to chunk")
+        logger.warning(f"[chunker] {doc.filename}: no models, skipping")
         return []
-    
-    for model in doc.models:
-        logger.debug(
-            f"  {model.model_name}: "
-            f"desc={bool(model.description)}, "
-            f"features={len(model.features)}, "
-            f"sections={len(model.spec_sections)}, "
-            f"tables={len(model.spec_tables)}, "
-            f"specs={len(model.specs)}, "
-            f"common_specs={len(model.common_specs)}"
+
+    all_chunks: List[DocumentChunk] = []
+    created_at = datetime.now(timezone.utc).isoformat()
+    multi_model = len(doc.models) > 1
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _base_meta(model: ModelSpec) -> dict:
+        pages = model.source_pages or []
+        return dict(
+            doc_id=doc.doc_id,
+            vendor=model.vendor,
+            model_name=model.model_name,
+            model_id=model.model_id,
+            product_family=model.product_family,
+            product_category=model.product_category or doc.product_category,
+            source_file=doc.source_path,
+            source_pages=pages,
+            page_start=pages[0] if pages else None,
+            page_end=pages[-1] if pages else None,
+            extraction_method=doc.extraction_method.value,
+            pipeline_version=doc.pipeline_version,
+            created_at=created_at,
         )
 
+    def _make(
+        text: str,
+        model: ModelSpec,
+        chunk_type: ChunkType,
+        section_name: str = "",
+        table_index: Optional[int] = None,
+        index: int = 0,
+    ) -> DocumentChunk:
+        cid = _chunk_id(doc.doc_id, model.model_id,
+                        f"{section_name}_{chunk_type.value}", index)
+        return DocumentChunk(
+            chunk_id=cid,
+            text=text,
+            chunk_type=chunk_type,
+            section_name=section_name,
+            table_index=table_index,
+            **_base_meta(model),
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1: Collect family-level sections that are shared across models.
+    # Emit each ONCE keyed on the first model (which acts as the family
+    # representative).  In single-model docs every section is "family-level".
+    # ------------------------------------------------------------------
+    family_rep: ModelSpec = doc.models[0]
+
+    # Gather unique section texts across all models for family sections
+    # (avoid duplicating identical text that every model copied from shared)
+    family_sections_emitted: Set[str] = set()  # content hash → already emitted
+
+    if not multi_model:
+        # Single model: straightforward - everything belongs to it
+        model = doc.models[0]
+        all_chunks.extend(
+            _chunks_for_model(model, doc, cfg, created_at, emit_family=True)
+        )
+        logger.info(
+            f"[chunker] {doc.filename}: 1 model → {len(all_chunks)} chunks"
+        )
+        return all_chunks
+
+    # ------------------------------------------------------------------
+    # Multi-model path
+    # ------------------------------------------------------------------
+
+    # Step A: Family-level sections emitted once under family_rep
+    for section_name, section_text in family_rep.spec_sections.items():
+        if not _is_family_level_section(section_name):
+            continue
+        text = _clean_text(section_text)
+        if not text:
+            continue
+        content_sig = hashlib.md5(text[:200].encode()).hexdigest()
+        if content_sig in family_sections_emitted:
+            continue
+        family_sections_emitted.add(content_sig)
+
+        chunk_type = _section_to_chunk_type(section_name)
+        header = (
+            f"Vendor: {family_rep.vendor}"
+            + (f" | Family: {family_rep.product_family}" if family_rep.product_family else "")
+            + f"\nSection: {section_name}\n\n"
+        )
+        full = header + text
+        size = _section_chunk_size(chunk_type, cfg)
+        for i, chunk_text in enumerate(_split_text(full, size, overlap=0)):
+            all_chunks.append(
+                _make(chunk_text, family_rep, chunk_type, section_name, index=i)
+            )
+
+    # Step B: Per-model spec profile (model-specific data only)
     for model in doc.models:
-        model_chunks = chunk_model_spec(model, doc, cfg)
-        all_chunks.extend(model_chunks)
+        all_chunks.extend(
+            _chunks_for_model(
+                model, doc, cfg, created_at, emit_family=False,
+                skip_sections=_is_family_level_section,
+            )
+        )
 
     logger.info(
-        f"Document '{doc.filename}' ({len(doc.models)} models) → "
-        f"{len(all_chunks)} total chunks"
+        f"[chunker] {doc.filename}: {len(doc.models)} models → {len(all_chunks)} chunks"
     )
     return all_chunks
+
+
+# ---------------------------------------------------------------------------
+# Per-model chunking
+# ---------------------------------------------------------------------------
+
+def _section_chunk_size(chunk_type: ChunkType, cfg: ChunkingConfig) -> int:
+    if chunk_type in (ChunkType.SPEC_TABLE, ChunkType.PERFORMANCE):
+        return cfg.table_chunk_size
+    return cfg.spec_chunk_size
+
+
+def _chunks_for_model(
+    model: ModelSpec,
+    doc: DatasheetDocument,
+    cfg: ChunkingConfig,
+    created_at: str,
+    emit_family: bool = True,
+    skip_sections=None,        # callable(section_name) → bool
+) -> List[DocumentChunk]:
+    """
+    Build all chunks for a single model.  Returns a list of DocumentChunk.
+
+    emit_family=True  → also emit family-level sections (single-model path).
+    skip_sections     → predicate for sections already emitted at family level.
+    """
+    chunks: List[DocumentChunk] = []
+    pages = model.source_pages or []
+
+    def _base() -> dict:
+        return dict(
+            doc_id=doc.doc_id,
+            vendor=model.vendor,
+            model_name=model.model_name,
+            model_id=model.model_id,
+            product_family=model.product_family,
+            product_category=model.product_category or doc.product_category,
+            source_file=doc.source_path,
+            source_pages=pages,
+            page_start=pages[0] if pages else None,
+            page_end=pages[-1] if pages else None,
+            extraction_method=doc.extraction_method.value,
+            pipeline_version=doc.pipeline_version,
+            created_at=created_at,
+        )
+
+    def _make(
+        text: str,
+        chunk_type: ChunkType,
+        section_name: str = "",
+        table_index: Optional[int] = None,
+        index: int = 0,
+    ) -> DocumentChunk:
+        cid = _chunk_id(doc.doc_id, model.model_id,
+                        f"{section_name}_{chunk_type.value}", index)
+        return DocumentChunk(
+            chunk_id=cid,
+            text=text,
+            chunk_type=chunk_type,
+            section_name=section_name,
+            table_index=table_index,
+            **_base(),
+        )
+
+    model_header = (
+        f"Vendor: {model.vendor} | Model: {model.model_name}"
+        + (f" | Family: {model.product_family}" if model.product_family else "")
+        + (f" | Category: {model.product_category}" if model.product_category else "")
+    )
+
+    # ── 1. Description ─────────────────────────────────────────────────────
+    if model.description.strip():
+        text = model_header + f"\n\nDescription:\n{model.description.strip()}"
+        for i, ct in enumerate(
+            _split_text(text, cfg.general_chunk_size, overlap=cfg.general_chunk_overlap)
+        ):
+            chunks.append(_make(ct, ChunkType.DESCRIPTION, "description", index=i))
+
+    # ── 2. Features ────────────────────────────────────────────────────────
+    if model.features and (emit_family or not _is_family_level_section("features")):
+        feat_text = (
+            model_header + "\nKey Features:\n"
+            + "\n".join(f"• {f}" for f in model.features)
+        )
+        for i, ct in enumerate(_split_text(feat_text, cfg.spec_chunk_size, overlap=0)):
+            chunks.append(_make(ct, ChunkType.FEATURES, "features", index=i))
+
+    # ── 3. Structured spec profile (specs + common_specs merged) ──────────
+    # This is the primary per-model spec chunk: one dense block with every
+    # key:value pair extracted from comparison tables.
+    spec_lines: List[str] = [model_header]
+    if model.specs:
+        spec_lines.append("Per-Model Specifications:")
+        spec_lines.extend(f"  {k}: {v}" for k, v in sorted(model.specs.items()))
+    if model.common_specs:
+        spec_lines.append("Shared Specifications:")
+        spec_lines.extend(f"  {k}: {v}" for k, v in sorted(model.common_specs.items()))
+
+    if len(spec_lines) > 1:
+        spec_text = _fix_unicode("\n".join(spec_lines))
+        for i, ct in enumerate(_split_text(spec_text, cfg.spec_chunk_size, overlap=0)):
+            chunks.append(_make(ct, ChunkType.SPEC_TEXT, "structured_specs", index=i))
+
+    # ── 4. Named spec sections ─────────────────────────────────────────────
+    for section_name, section_text in model.spec_sections.items():
+        # In multi-model docs, skip sections emitted at family level
+        if skip_sections is not None and skip_sections(section_name):
+            continue
+        text = _clean_text(section_text)
+        if not text:
+            continue
+
+        chunk_type = _section_to_chunk_type(section_name)
+        header = model_header + f"\nSection: {section_name}\n\n"
+        full = header + text
+        size = _section_chunk_size(chunk_type, cfg)
+        for i, ct in enumerate(_split_text(full, size, overlap=0)):
+            chunks.append(_make(ct, chunk_type, section_name, index=i))
+
+    # ── 5. Spec tables ─────────────────────────────────────────────────────
+    for tidx, table in enumerate(model.spec_tables):
+        flat = table.to_flat_text().strip()
+        md = table.to_markdown().strip()
+        table_text_raw = flat if len(flat) >= len(md) else md
+        if not table_text_raw:
+            continue
+
+        header = (
+            model_header
+            + f"\nSpecification Table (page {table.page_number}):\n\n"
+        )
+        full = _fix_unicode(header + table_text_raw)
+        for i, ct in enumerate(_split_text(full, cfg.table_chunk_size, overlap=0)):
+            chunks.append(
+                _make(ct, ChunkType.SPEC_TABLE, f"table_{tidx}", tidx, index=i)
+            )
+
+    logger.debug(
+        f"[chunker] model '{model.model_name}': {len(chunks)} chunks "
+        f"(desc={bool(model.description)}, "
+        f"feats={len(model.features)}, "
+        f"sections={len(model.spec_sections)}, "
+        f"tables={len(model.spec_tables)}, "
+        f"specs={len(model.specs)}+{len(model.common_specs)})"
+    )
+    return chunks
