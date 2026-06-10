@@ -56,30 +56,28 @@ class PDFConfig:
 class ChunkingConfig:
     """Text chunking / splitting settings."""
     # Model-level spec chunks
-    spec_chunk_size: int = 1200
-    spec_chunk_overlap: int = 200
+    spec_chunk_size: int = 400
+    spec_chunk_overlap: int = 80
 
     # Table chunks — split large tables into rows/groups
-    table_chunk_size: int = 1500
-    table_chunk_overlap: int = 150
+    table_chunk_size: int = 500
+    table_chunk_overlap: int = 50
 
     # General description chunks
-    general_chunk_size: int = 1000
-    general_chunk_overlap: int = 150
+    general_chunk_size: int = 300
+    general_chunk_overlap: int = 60
 
     # Hard limit: if a single spec block exceeds this, split it
-    max_single_chunk: int = 2000
+    max_single_chunk: int = 600
 
 
 @dataclass
 class EmbeddingConfig:
-    """Embedding model settings."""
-    # Can also use: "all-MiniLM-L6-v2" (faster, less accurate)
-    # or "BAAI/bge-large-en-v1.5" (more accurate, heavier)
-    model_name: str = "sentence-transformers/all-mpnet-base-v2"
-    device: str = "cpu"
+    """Local embedding service settings."""
+    base_url: str = "http://192.168.2.123:11434"
+    model_name: str = "nomic-embed-text"
     batch_size: int = 32
-    normalize_embeddings: bool = True
+    timeout_seconds: int = 300
 
 
 @dataclass
@@ -132,12 +130,12 @@ class PipelineConfig:
     # Processing behaviour
     skip_existing: bool = True          # Skip PDFs already in vector DB
     save_intermediate: bool = True      # Save extracted JSON to PROCESSED_DIR
-    parallel_workers: int = 2
+    parallel_workers: int = 8
     log_level: str = "INFO"
 
     # LLM config for advanced model identification
     use_llm_for_model_id: bool = True
-    llm_model: str = "qwen3:8b"
+    llm_model: str = "qwen3:14b"
     llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", "local"))
     llm_base_url: str = "http://192.168.2.123:11434/v1"
 

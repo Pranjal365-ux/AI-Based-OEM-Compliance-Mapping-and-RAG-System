@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from loguru import logger
 
@@ -36,7 +36,11 @@ _SECTION_CHUNK_TYPE_MAP = {
     "specifications": ChunkType.SPEC_TEXT,
     "technical specifications": ChunkType.SPEC_TEXT,
     "spec": ChunkType.SPEC_TEXT,
-    "hardware specifications": ChunkType.SPEC_TEXT,
+    "hardware specifications": ChunkType.SPEC_TABLE,
+    "specifications hardware features": ChunkType.SPEC_TABLE,
+    "system performance and capacity": ChunkType.SPEC_TABLE,
+    "system performance": ChunkType.SPEC_TABLE,
+    "hardware features": ChunkType.SPEC_TABLE,
     "system specifications": ChunkType.SPEC_TEXT,
     "product specifications": ChunkType.SPEC_TEXT,
     "performance": ChunkType.PERFORMANCE,
@@ -122,7 +126,27 @@ def _section_to_chunk_type(section_name: str) -> ChunkType:
     return ChunkType.GENERAL
 
 
-# ─── Line Deduplication ──────────────────────────────────────────────────────────
+# ─── Unicode / Encoding Fixes ────────────────────────────────────────────────────
+
+# pdfplumber on some PDFs strips the μ (U+03BC, micro sign) or replaces it with
+# a plain ASCII "u".  This mapping restores the most common unit occurrences seen
+# in networking/power datasheets so spec values like "7.5 μs" are stored correctly.
+_UNICODE_REPAIRS = [
+    # "7.5 s" or "7.50 s" with a space — must be latency, not seconds
+    (re.compile(r'(\d+\.?\d*)\s+s\b(?!\s*[/A-Za-z])'), r'\1 μs'),
+    # Explicit replacement for pdfplumber's known lossy substitution
+    (re.compile(r'\bus\b(?=\s*\()'), 'μs'),   # e.g. "7.5 us (latency)"
+]
+
+
+def _fix_unicode(text: str) -> str:
+    """Repair known Unicode losses introduced by PDF text extraction."""
+    for pattern, replacement in _UNICODE_REPAIRS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+
 
 def _dedup_lines(text: str) -> str:
     """Remove consecutive duplicate lines produced by multi-column PDF extraction.
@@ -192,12 +216,31 @@ def _split_text(
             if current:
                 chunks.append(current)
 
-            # Apply overlap: append last `overlap` chars from previous chunk
+            # Apply overlap: take the last N *complete lines* of the previous
+            # chunk as carry-over context, not a raw character slice.
+            # Raw character slicing (the previous approach) caused mangled
+            # partial-line prefixes that pdfplumber reproduced verbatim —
+            # producing the "line repeated twice" pattern seen in the DB.
             if overlap > 0 and len(chunks) > 1:
                 overlapped = [chunks[0]]
                 for i in range(1, len(chunks)):
-                    suffix = overlapped[-1][-overlap:] if len(overlapped[-1]) > overlap else overlapped[-1]
-                    overlapped.append(suffix + "\n" + chunks[i])
+                    prev = overlapped[-1]
+                    # Collect complete lines from the tail of the previous chunk
+                    # until we reach the overlap budget.
+                    prev_lines = prev.splitlines()
+                    carry_lines: List[str] = []
+                    carry_len = 0
+                    for line in reversed(prev_lines):
+                        line_len = len(line) + 1  # +1 for the newline
+                        if carry_len + line_len > overlap and carry_lines:
+                            break
+                        carry_lines.insert(0, line)
+                        carry_len += line_len
+                    carry = "\n".join(carry_lines).strip()
+                    if carry:
+                        overlapped.append(carry + "\n" + chunks[i])
+                    else:
+                        overlapped.append(chunks[i])
                 return [c.strip() for c in overlapped if c.strip()]
             return [c.strip() for c in chunks if c.strip()]
 
@@ -298,8 +341,8 @@ def chunk_model_spec(
         canonical_name = _canonicalize_section_name(section_name)
         chunk_type = _section_to_chunk_type(canonical_name)
 
-        # Deduplicate repeated lines before building the chunk text
-        clean_section_text = _dedup_lines(section_text)
+        # Repair encoding losses (e.g. μ stripped to bare "s") then deduplicate
+        clean_section_text = _dedup_lines(_fix_unicode(section_text))
 
         # Build a context header for each chunk so it's self-contained
         header = (
@@ -360,7 +403,7 @@ def chunk_model_spec(
             lines.append("Common Specifications:")
             lines.extend(f"{key}: {value}" for key, value in model.common_specs.items())
 
-        specs_text = "\n".join(lines)
+        specs_text = _fix_unicode("\n".join(lines))
         for i, chunk_text in enumerate(
             _split_text(specs_text, cfg.spec_chunk_size, cfg.spec_chunk_overlap)
         ):
@@ -393,15 +436,15 @@ def chunk_document(
         return []
     
     for model in doc.models:
-        print(
-            model.model_name,
-            "desc=", bool(model.description),
-            "features=", len(model.features),
-            "sections=", len(model.spec_sections),
-            "tables=", len(model.spec_tables),
-            "specs=", len(model.specs),
-            "common_specs=", len(model.common_specs),
-        )    
+        logger.debug(
+            f"  {model.model_name}: "
+            f"desc={bool(model.description)}, "
+            f"features={len(model.features)}, "
+            f"sections={len(model.spec_sections)}, "
+            f"tables={len(model.spec_tables)}, "
+            f"specs={len(model.specs)}, "
+            f"common_specs={len(model.common_specs)}"
+        )
 
     for model in doc.models:
         model_chunks = chunk_model_spec(model, doc, cfg)

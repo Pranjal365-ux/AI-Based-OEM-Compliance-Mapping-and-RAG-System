@@ -255,15 +255,13 @@ class OEMIngestionPipeline:
 
             # ── Save intermediate JSON ────────────────────────────────────────
             if self.cfg.save_intermediate:
-                    print("BEFORE SAVE")
-
-            for model in doc.models:
-                print(
-                    model.model_name,
-                    len(model.spec_sections),
-                    bool(model.description)
-                )
-            _save_intermediate(doc, self.cfg)
+                for model in doc.models:
+                    logger.debug(
+                        f"  {model.model_name}: "
+                        f"{len(model.spec_sections)} sections, "
+                        f"desc={bool(model.description)}"
+                    )
+                _save_intermediate(doc, self.cfg)
 
             # ── Step 4: Chunk & embed ─────────────────────────────────────────
             logger.info(f"  [4/4] Chunking and embedding…")

@@ -9,24 +9,22 @@ Supports:
   - Stats and inventory
 """
 from __future__ import annotations
-
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from loguru import logger
-from sentence_transformers import SentenceTransformer
 
 from config.settings import EmbeddingConfig, VectorStoreConfig
 from models.schemas import ChunkType, DocumentChunk
+from services.embedding_service import EmbeddingService
 
 
 class VectorStoreManager:
     """
     Wraps ChromaDB with a high-level API for the OEM pipeline.
-    Uses SentenceTransformers for local embeddings (no external API needed).
+    Uses the local Ollama embedding service for Nomic embeddings.
     """
 
     def __init__(
@@ -38,7 +36,7 @@ class VectorStoreManager:
         self.emb_cfg = emb_cfg
         self._client: Optional[chromadb.PersistentClient] = None
         self._collection = None
-        self._embedder: Optional[SentenceTransformer] = None
+        self._embedder: Optional[EmbeddingService] = None
 
     # ─── Lifecycle ───────────────────────────────────────────────────────────────
 
@@ -63,13 +61,16 @@ class VectorStoreManager:
         )
 
     def load_embedder(self) -> None:
-        """Load the sentence transformer model into memory."""
-        logger.info(f"Loading embedding model: {self.emb_cfg.model_name}")
-        self._embedder = SentenceTransformer(
-            self.emb_cfg.model_name,
-            device=self.emb_cfg.device,
+        """Initialize the local embedding service client."""
+        logger.info(
+            f"Using local embedding service: {self.emb_cfg.model_name} "
+            f"at {self.emb_cfg.base_url}"
         )
-        logger.info("Embedding model loaded")
+        self._embedder = EmbeddingService(
+            base_url=self.emb_cfg.base_url,
+            model=self.emb_cfg.model_name,
+            timeout=self.emb_cfg.timeout_seconds,
+        )
 
     def close(self) -> None:
         """Gracefully release resources."""
@@ -80,16 +81,16 @@ class VectorStoreManager:
     # ─── Embedding ────────────────────────────────────────────────────────────────
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """Embed a list of strings, returning float vectors."""
+        """Embed strings with the configured local embedding service."""
         if self._embedder is None:
             self.load_embedder()
-        embeddings = self._embedder.encode(
-            texts,
-            batch_size=self.emb_cfg.batch_size,
-            normalize_embeddings=self.emb_cfg.normalize_embeddings,
-            show_progress_bar=len(texts) > 50,
-        )
-        return embeddings.tolist()
+
+        embeddings: List[List[float]] = []
+        for start in range(0, len(texts), self.emb_cfg.batch_size):
+            batch = texts[start:start + self.emb_cfg.batch_size]
+            embeddings.extend(self._embedder.embed(batch))
+
+        return embeddings
 
     # ─── CRUD ─────────────────────────────────────────────────────────────────────
 
@@ -122,6 +123,9 @@ class VectorStoreManager:
             metadatas = [c.to_chroma_metadata() for c in batch]
 
             try:
+                logger.info(
+                    f"Embedding batch: {len(texts)} chunks"
+                )
                 embeddings = self.embed_texts(texts)
                 self._collection.upsert(
                     ids=ids,
