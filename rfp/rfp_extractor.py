@@ -41,11 +41,15 @@ from services.llm_services import llm
 logger = logging.getLogger(__name__)
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-CHUNK_SIZE        = 3_000   # chars per LLM extraction call
-MAX_WORKERS       = 8       # parallel extraction threads
-DISCOVERY_PAGE_CHAR_BUDGET = 420
-DISCOVERY_DIGEST_CHAR_BUDGET = 12_000
-DISCOVERY_PAGE_BATCH_SIZE = 4
+CHUNK_SIZE                   = 3_000   # chars per LLM extraction call
+MAX_WORKERS                  = 8       # parallel extraction threads
+
+# Discovery: generous budgets so the LLM receives enough signal
+DISCOVERY_PAGE_CHAR_BUDGET   = 600     # chars kept per page in the digest
+DISCOVERY_DIGEST_CHAR_BUDGET = 25_000  # total digest cap (covers ~40 pages)
+
+# How many chars of raw page text to show per page in the digest (not just headings)
+DISCOVERY_RAW_CHARS_PER_PAGE = 400
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -95,9 +99,9 @@ class ProductManifest:
             return "No products discovered."
         lines = ["Discovered products:", ""]
         for i, p in enumerate(self.products):
-            page_text = self._format_pages(p.pages) if p.pages else f"{p.start_page}-{p.end_page}"
+            page_text = self._format_pages(p.pages) if p.pages else f"{p.start_page}–{p.end_page}"
             lines.append(
-                f"  [{i}]  {p.product:<25}  pages {page_text}"
+                f"  [{i}]  {p.product:<40}  pages {page_text}"
                 f"  ({p.page_count} page{'s' if p.page_count != 1 else ''})"
             )
         return "\n".join(lines)
@@ -115,9 +119,9 @@ class ProductManifest:
             if page == prev + 1:
                 prev = page
                 continue
-            ranges.append(str(start) if start == prev else f"{start}-{prev}")
+            ranges.append(str(start) if start == prev else f"{start}–{prev}")
             start = prev = page
-        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        ranges.append(str(start) if start == prev else f"{start}–{prev}")
         return ", ".join(ranges)
 
 
@@ -131,14 +135,11 @@ class RFPRequirementExtractor:
 
     Phase 1 – Discovery
         extract_pages()      →  page-wise text with preserved page numbers
-        discover_products()  →  ProductManifest (1 LLM call)
-                                Product names are taken verbatim from the RFP —
-                                no external taxonomy is applied.
+        discover_products()  →  ProductManifest
+                                Product names taken from the RFP verbatim.
 
     Phase 2 – Extraction  (after user selects a product)
         extract_for_product()  →  List[Requirement]
-                                  category field = functional sub-topic derived
-                                  from the text, not from a fixed category list.
     """
 
     QUANT_PATTERN = re.compile(
@@ -149,9 +150,24 @@ class RFPRequirementExtractor:
         re.IGNORECASE,
     )
 
-    _THINK_RE      = re.compile(r"<think>.*?</think>", re.DOTALL)
-    _FENCE_OPEN_RE = re.compile(r"^```(?:json)?\s*",   re.MULTILINE)
-    _FENCE_CLOSE_RE = re.compile(r"```\s*$",           re.MULTILINE)
+    _THINK_RE       = re.compile(r"<think>.*?</think>", re.DOTALL)
+    _FENCE_OPEN_RE  = re.compile(r"^```(?:json)?\s*",   re.MULTILINE)
+    _FENCE_CLOSE_RE = re.compile(r"```\s*$",            re.MULTILINE)
+
+    # ── heading patterns ──────────────────────────────────────────────────────
+
+    _NUMBERED_HEADING_RE = re.compile(
+        r"^(?P<num>\d+(?:\.\d+)*)"   # section number  e.g. "3.1.2"
+        r"[\s\.\):]+"                # separator
+        r"(?P<title>[A-Za-z].{2,})"  # title must start with a letter
+    )
+
+    _UNIT_WORDS = frozenset({
+        "GB", "MB", "TB", "KB", "GHZ", "MHZ", "KHZ", "HZ",
+        "GBPS", "MBPS", "KBPS", "BPS", "MS", "SEC", "MIN",
+        "HTTP", "HTTPS", "FTP", "SSH", "TCP", "UDP", "IP",
+        "N/A", "NA", "TBD", "ID", "NO", "OK", "VS",
+    })
 
     # ──────────────────────────────────────────────────────────────────────────
     # PHASE 1A – PAGE EXTRACTION
@@ -184,60 +200,35 @@ class RFPRequirementExtractor:
 
         Strategy
         --------
-        1. Build a page digest with headings, requirement-like lines, and short
-           context excerpts.
-        2. One LLM call on that outline  →  JSON array of product entries.
-        3. Parse, validate, return ProductManifest.
+        1. Build a rich page digest with headings + raw text snippets.
+        2. One LLM call on that digest → JSON array of product entries.
+        3. If LLM fails or returns empty, fall back to heading-based heuristic.
+        4. Parse, validate, return ProductManifest.
         """
         print("\n=== PRODUCT DISCOVERY ===")
         digest = self._build_page_digest(pages)
-        print(f"Digest size: {len(digest)} chars  (from {len(pages)} pages)")
+        print(f"[Discovery] Digest: {len(digest):,} chars  ({len(pages)} pages)")
 
         manifest = self._llm_discover_products(digest, total_pages=len(pages))
-        if not manifest.products and len(pages) > DISCOVERY_PAGE_BATCH_SIZE:
-            logger.info("Retrying product discovery in page batches")
-            manifest = self._discover_products_in_batches(pages)
+
+        if not manifest.products:
+            print("LLM discovery returned nothing; using heuristic fallback")
+            manifest = self._heuristic_discover_products(pages)
+
         print(f"\n{manifest.display()}")
         return manifest
 
     # ── heading detection ─────────────────────────────────────────────────────
-    #
-    # A valid heading must be ONE of:
-    #   (A) Numbered section:  digits-and-dots prefix, then whitespace, then
-    #       at least one letter (rules out "45 M", "3.5 GHz", bare numbers).
-    #       The text portion must contain at least one letter to exclude
-    #       lines like "1.  " or table row numbers.
-    #
-    #   (B) ALL-CAPS title:  2+ words, every word ≥ 2 chars, no word is a
-    #       pure number or a common unit abbreviation.  Minimum total length
-    #       of 6 chars.  This blocks "HTTP", "ID", "N/A", "GB", "45 M".
-    #
-    # Both forms: max 120 chars, must not look like a URL or file path.
-    #
-    _NUMBERED_HEADING_RE = re.compile(
-        r"^(?P<num>\d+(?:\.\d+)*)"   # section number  e.g. "3.1.2"
-        r"[\s\.\):]+"                # separator       e.g. ". " or ") "
-        r"(?P<title>[A-Za-z].{2,})"  # title must START with a letter, ≥3 chars
-    )
-
-    # Words that disqualify an ALL-CAPS line from being a heading
-    _UNIT_WORDS = frozenset({
-        "GB", "MB", "TB", "KB", "GHZ", "MHZ", "KHZ", "HZ",
-        "GBPS", "MBPS", "KBPS", "BPS", "MS", "SEC", "MIN",
-        "HTTP", "HTTPS", "FTP", "SSH", "TCP", "UDP", "IP",
-        "N/A", "NA", "TBD", "ID", "NO", "OK", "VS",
-    })
 
     def _is_heading_line(self, line: str) -> tuple[bool, int]:
         """
         Returns (is_heading, depth).
-        depth = number of numeric components in the section number (1 for "3.",
-        2 for "3.1", 3 for "3.1.2").  ALL-CAPS headings get depth=0.
+        depth = number of numeric components in the section number.
+        ALL-CAPS headings get depth=1.
         """
         if not line or len(line) > 120:
             return False, 0
 
-        # Reject URLs and file paths immediately
         if any(c in line for c in ("://", "\\", ".com", ".org", ".pdf")):
             return False, 0
 
@@ -246,57 +237,42 @@ class RFPRequirementExtractor:
         if m:
             title = m.group("title").strip()
             title_words = title.split()
-            # title must contain at least 2 letters
             if sum(1 for c in title if c.isalpha()) < 2:
                 return False, 0
-            # reject if the entire title is a single unit/measurement token
-            # e.g. "3.5 GHz", "100 Mbps" — title word is a known unit abbreviation
             if len(title_words) == 1 and title_words[0].upper() in (
-                self._UNIT_WORDS | {
-                    "M", "K", "G", "T", "MHZ", "GHZ", "MBPS", "GBPS",
-                    "MS", "KB", "MB", "GB", "TB", "HZ",
-                }
+                self._UNIT_WORDS | {"M", "K", "G", "T", "MHZ", "GHZ", "MBPS", "GBPS", "MS", "KB", "MB", "GB", "TB", "HZ"}
             ):
                 return False, 0
             depth = len(m.group("num").split("."))
             return True, depth
 
-        # (B) ALL-CAPS heading (no section number)
+        # (B) ALL-CAPS heading (≥ 2 words, all caps, no units)
         words = line.split()
         if len(words) < 2 or len(line) < 6:
             return False, 0
-        if not all(w.replace("-", "").replace("/", "").replace("&", "").isupper()
-                   for w in words):
+        if not all(w.replace("-", "").replace("/", "").replace("&", "").isupper() for w in words):
             return False, 0
-        # Reject if any word is a known unit/abbreviation or a pure number
         upper_words = {w.upper() for w in words}
         if upper_words & self._UNIT_WORDS:
             return False, 0
         if any(w.replace(".", "").isdigit() for w in words):
             return False, 0
-        return True, 0
+        return True, 1
+
+    # ── digest builder ────────────────────────────────────────────────────────
 
     def _build_page_digest(self, pages: List[PageText]) -> str:
         """
-        Build an indented heading outline so the LLM receives structural depth
-        information, not just a flat list.
+        Build a rich page-by-page digest for the discovery LLM call.
 
-        Output format:
-            Page  12 |   3  Next-Generation Firewall
-            Page  12 |     3.1  General Requirements
-            Page  13 |     3.2  Performance Requirements
-            Page  19 |   4  SIEM Solution
-            ...
-
-        Indentation = 2 spaces × (depth - 1).  ALL-CAPS headings (depth 0)
-        get no indentation.  This lets the LLM visually distinguish parent
-        product headings from their child sub-sections without reasoning about
-        numbering conventions.
+        Each page block looks like:
+            --- Page 5 ---
+            Headings: 3. Next-Generation Firewall | 3.1 Performance
+            Text: The firewall shall support a minimum throughput of 10 Gbps...
         """
         rows: List[str] = []
         for p in pages:
             headings: List[str] = []
-            signals: List[str] = []
             for raw_line in p.text.splitlines():
                 line = raw_line.strip()
                 if not line:
@@ -305,208 +281,82 @@ class RFPRequirementExtractor:
                 if is_heading:
                     indent = "  " * max(0, depth - 1)
                     headings.append(f"{indent}{line}")
-                    continue
-                if self._looks_like_requirement_signal(line):
-                    signals.append(self._compact_line(line, max_chars=135))
 
-            excerpt = self._page_excerpt(p.text, max_chars=180)
-            page_rows = [f"Page {p.page_number:>4}"]
+            # Always include raw text snippet so the LLM can infer product
+            # context even when the document has no numbered headings
+            raw_snippet = " ".join(p.text.split())[:DISCOVERY_RAW_CHARS_PER_PAGE]
+
+            block_parts = [f"--- Page {p.page_number} ---"]
             if headings:
-                page_rows.append("  Headings: " + " | ".join(headings[:5]))
-            if signals:
-                page_rows.append("  Signals: " + " | ".join(signals[:5]))
-            if excerpt:
-                page_rows.append("  Excerpt: " + excerpt)
-            rows.append(self._fit_text("\n".join(page_rows), DISCOVERY_PAGE_CHAR_BUDGET))
-        return self._fit_text("\n".join(rows), DISCOVERY_DIGEST_CHAR_BUDGET)
+                block_parts.append("Headings: " + " | ".join(headings[:8]))
+            if raw_snippet:
+                block_parts.append("Text: " + raw_snippet)
 
-    def _looks_like_requirement_signal(self, line: str) -> bool:
-        if len(line) < 12 or len(line) > 220:
-            return False
-        lower = line.lower()
-        signal_terms = (
-            "shall", "must", "required", "requirement", "support", "provide",
-            "capable", "capacity", "throughput", "performance", "integrat",
-            "compliance", "certificate", "license", "appliance", "platform",
-            "solution", "system", "service", "software", "hardware",
-        )
-        if any(term in lower for term in signal_terms):
-            return True
-        if re.search(r"\b\d+(?:\.\d+)?\s*(gbps|mbps|tb|gb|mb|users|sessions|eps|ports?)\b", lower):
-            return True
-        if re.match(r"^[-*•]|\d+[\.\)]\s+", line):
-            return True
-        return False
+            rows.append("\n".join(block_parts))
 
-    def _page_excerpt(self, text: str, max_chars: int = 700) -> str:
-        cleaned = " ".join(text.split())
-        if len(cleaned) <= max_chars:
-            return cleaned
-        return cleaned[:max_chars].rsplit(" ", 1)[0]
+        full = "\n\n".join(rows)
+        if len(full) > DISCOVERY_DIGEST_CHAR_BUDGET:
+            full = full[:DISCOVERY_DIGEST_CHAR_BUDGET]
+        return full
 
-    def _compact_line(self, text: str, max_chars: int = 140) -> str:
-        return self._fit_text(" ".join(text.split()), max_chars)
-
-    def _fit_text(self, text: str, max_chars: int) -> str:
-        if len(text) <= max_chars:
-            return text
-        trimmed = text[: max_chars - 3].rsplit(" ", 1)[0]
-        return f"{trimmed}..."
-
-    def _llm_discover_products_heading_outline_legacy(
-        self, digest: str, total_pages: int
-    ) -> ProductManifest:
-        """
-        Single LLM call on the indented heading outline.
-
-        The prompt is framed as a two-step structural parse:
-          Step 1 — identify the shallowest numbered level that contains product
-                   names (usually depth-1 headings like "3. SIEM", not depth-2
-                   like "3.1 Performance").
-          Step 2 — for each product heading, record start/end pages using only
-                   the page numbers printed in the outline.
-
-        The LLM is explicitly forbidden from inferring products that do not
-        appear as headings in the outline.
-        """
-        prompt = f"""You are a document structure parser. You will receive an
-indented heading outline extracted from an RFP. Each line shows a page number
-and a heading. Indentation reflects nesting depth (deeper = child section).
-
-Your task is to identify every product or service that has its own dedicated
-requirements section in this RFP, and return the exact page range for each.
-
-Follow these two steps internally, then output only the final JSON:
-
-STEP 1 — Identify the correct heading depth for product sections:
-  Look at the outline and find the SHALLOWEST level of numbered headings that
-  contain distinct product or service names (e.g. "3. SIEM Solution",
-  "4. Next-Generation Firewall").  These are the product headings.
-  Deeper headings at that same section number (e.g. "3.1 Performance",
-  "3.2 Logging") are sub-sections WITHIN a product — do NOT treat them as
-  separate products.
-
-STEP 2 — For each product heading from Step 1:
-  - "product"    = the heading text, copied VERBATIM from the outline.
-                   Do not paraphrase, shorten, strip numbering, or rename.
-  - "start_page" = the page number shown on that heading's line.
-  - "end_page"   = the page number shown on the line immediately before the
-                   NEXT sibling product heading, or {total_pages} for the last.
-
-Hard rules:
-  - Only include headings that are VISIBLE IN THE OUTLINE BELOW.
-    Do not infer or hallucinate product names from your general knowledge.
-  - Exclude: cover page titles, table-of-contents lines, glossary sections,
-    scope/introduction sections, commercial/contractual sections.
-  - If a product heading appears in the table of contents AND again in the
-    body, use the body occurrence (higher page number).
-
-Return ONLY a JSON array. No markdown, no code fences, no explanation.
-
-Each object must have exactly these keys:
-  "product"    – verbatim heading text (string)
-  "start_page" – integer, 1-based
-  "end_page"   – integer, 1-based
-
-HEADING OUTLINE:
-{digest}
-"""
-
-        try:
-            response = llm.generate(prompt, max_tokens=1200)
-            response = self._clean_llm_response(response)
-            data = self._loads_json(response)
-
-            if not isinstance(data, list):
-                raise ValueError(f"Expected list, got {type(data)}")
-
-            products: List[ProductEntry] = []
-            for item in data:
-                name  = str(item.get("product", "")).strip()
-                start = int(item["start_page"])
-                end   = int(item["end_page"])
-
-                # ── post-parse sanity filter ───────────────────────────────
-                # Reject entries whose name looks like noise rather than a
-                # real product section heading.
-                if self._is_junk_product_name(name):
-                    logger.debug(f"Rejected junk product name: {name!r}")
-                    continue
-
-                # Clamp page numbers to valid range
-                start = max(1, min(start, total_pages))
-                end   = max(start, min(end, total_pages))
-
-                products.append(ProductEntry(
-                    product=name,
-                    start_page=start,
-                    end_page=end,
-                ))
-
-            products.sort(key=lambda p: p.start_page)
-            return ProductManifest(products=products)
-
-        except Exception as exc:
-            logger.warning(f"Product discovery LLM call failed: {exc}")
-            logger.warning(f"Raw response was: {response!r}")
-            return ProductManifest(products=[])
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # PHASE 2 – PRODUCT-SPECIFIC REQUIREMENT EXTRACTION
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── LLM discovery call ────────────────────────────────────────────────────
 
     def _llm_discover_products(
         self, digest: str, total_pages: int
     ) -> ProductManifest:
         """
-        Discover demanded products from page-level evidence, not just headings.
-        The model may infer product labels from contextual requirements, but it
-        must also return the exact pages that justify each product.
+        Single LLM call to identify all products and their page sets.
+
+        The prompt is explicit, minimal, and asks for a "pages" array.
+        Robust JSON extraction handles <think> blocks and code fences.
         """
-        response = ""
-        prompt = f"""You are an expert RFP analyst. You will receive a page-wise
-digest of an RFP. Each page includes headings and body excerpts that may contain
-requirements. The RFP may demand products, platforms, modules, subscriptions,
-appliances, software, services, or solution areas without naming them directly.
+        prompt = f"""You are an expert RFP analyst. Below is a page-by-page digest of an RFP.
+Each page block shows its page number, any section headings, and a text excerpt.
 
-Your task:
-1. Identify ALL distinct demanded products or solution areas in the RFP.
-2. Contextually infer a clear product label when the RFP describes capabilities
-   without a direct product name.
-3. Assign every page that contains requirements, specifications, scope, or
-   evaluation criteria for that product to that product.
+Your task: identify every distinct product, solution, or service that has its own
+requirements section in this RFP.
 
-Hard rules:
-- Do not use a fixed product taxonomy or hardcoded product categories.
-- Infer labels only from the text in the digest, not from outside knowledge.
-- A page may belong to multiple products if it has requirements for multiple
-  demanded products.
-- Exclude cover page titles, table-of-contents lines, glossary sections,
-  instructions to bidders, commercial/contractual/legal sections, and generic
-  background unless they contain product requirements.
-- Merge synonyms and variants that refer to the same demanded item.
-- Keep separate products separate when their requirements could lead to
-  different compliance reports.
+Rules:
+- Use the product/solution name derived/concluded from the specifications in the headings or text.
+- For each product, list every page number that contains requirements for that product.
+- A page may belong to multiple products.
+- Exclude: cover page, table of contents, glossary, introduction, and legal/commercial sections
+  unless they contain technical requirements.
+- Do not merge separate products into one entry.
+- Do not split a single product into multiple entries.
 
-Return ONLY a JSON array. No markdown, no code fences, no explanation.
+Return ONLY a valid JSON array. No markdown, no code fences, no explanation, no preamble.
+The array must be valid JSON that can be parsed directly.
 
-Each object must have exactly these keys:
-  "product"  - concise product/solution label from the RFP context
-  "pages"    - sorted array of unique 1-based page numbers for that product
-  "evidence" - short phrase from the digest explaining why this is a product
+Each array element must have exactly these keys:
+  "product"  - product or solution name (string)
+  "pages"    - sorted array of 1-based page numbers for that product (array of integers)
+
+Example of valid output:
+[
+  {{"product": "Next-Generation Firewall", "pages": [3, 4, 5, 11]}},
+  {{"product": "SIEM Solution", "pages": [6, 7, 8]}}
+]
 
 RFP PAGE DIGEST:
 {digest}
 """
 
+        response = ""
         try:
-            response = llm.generate(prompt, max_tokens=1200)
-            print("\n===== RAW RESPONSE =====")
-            print(response[:5000])
-            print("========================\n")
-            data = self._loads_json(self._clean_llm_response(response))
+            response = llm.generate(prompt, max_tokens=2000)
+            logger.debug(f"Discovery raw response (first 1000): {response[:1000]!r}")
+
+            cleaned = self._clean_llm_response(response)
+
+            # Guard: empty response after cleaning
+            if not cleaned.strip():
+                raise ValueError("LLM returned empty response after cleaning")
+
+            data = self._loads_json(cleaned)
+
             if not isinstance(data, list):
-                raise ValueError(f"Expected list, got {type(data)}")
+                raise ValueError(f"Expected JSON array, got {type(data).__name__}")
 
             by_name: dict[str, ProductEntry] = {}
             for item in data:
@@ -515,12 +365,13 @@ RFP PAGE DIGEST:
                 name = str(item.get("product", "")).strip()
                 page_numbers = self._coerce_page_list(item, total_pages)
 
+                # Fallback: accept start_page / end_page if "pages" is missing
                 if not page_numbers:
-                    start = int(item.get("start_page", 0) or 0)
-                    end = int(item.get("end_page", 0) or 0)
+                    start = self._safe_int(item.get("start_page"))
+                    end   = self._safe_int(item.get("end_page"))
                     if start and end:
                         start = max(1, min(start, total_pages))
-                        end = max(start, min(end, total_pages))
+                        end   = max(start, min(end, total_pages))
                         page_numbers = list(range(start, end + 1))
 
                 if self._is_junk_product_name(name) or not page_numbers:
@@ -529,66 +380,82 @@ RFP PAGE DIGEST:
 
                 key = self._normalise_product_key(name)
                 if key in by_name:
-                    merged_pages = sorted(set(by_name[key].pages) | set(page_numbers))
-                    by_name[key].pages = merged_pages
-                    by_name[key].start_page = min(merged_pages)
-                    by_name[key].end_page = max(merged_pages)
-                    continue
-
-                by_name[key] = ProductEntry(
-                    product=name,
-                    start_page=min(page_numbers),
-                    end_page=max(page_numbers),
-                    pages=page_numbers,
-                )
+                    merged = sorted(set(by_name[key].pages) | set(page_numbers))
+                    by_name[key].pages      = merged
+                    by_name[key].start_page = min(merged)
+                    by_name[key].end_page   = max(merged)
+                else:
+                    by_name[key] = ProductEntry(
+                        product    = name,
+                        start_page = min(page_numbers),
+                        end_page   = max(page_numbers),
+                        pages      = sorted(set(page_numbers)),
+                    )
 
             products = sorted(by_name.values(), key=lambda p: p.start_page)
             return ProductManifest(products=products)
 
         except Exception as exc:
             logger.warning(f"Product discovery LLM call failed: {exc}")
-            logger.warning(f"Raw response was: {response!r}")
+            if response:
+                logger.warning(f"Raw response (first 500 chars): {response[:500]!r}")
             return ProductManifest(products=[])
 
-    def _discover_products_in_batches(self, pages: List[PageText]) -> ProductManifest:
-        manifests: List[ProductManifest] = []
-        for start in range(0, len(pages), DISCOVERY_PAGE_BATCH_SIZE):
-            batch = pages[start:start + DISCOVERY_PAGE_BATCH_SIZE]
-            digest = self._build_page_digest(batch)
-            logger.info(
-                "Product discovery batch pages %s-%s digest=%s chars",
-                batch[0].page_number,
-                batch[-1].page_number,
-                len(digest),
-            )
-            manifest = self._llm_discover_products(digest, total_pages=len(pages))
-            manifests.append(manifest)
-        return self._merge_product_manifests(manifests)
+    # ── heuristic fallback ────────────────────────────────────────────────────
 
-    def _merge_product_manifests(self, manifests: List[ProductManifest]) -> ProductManifest:
-        by_name: dict[str, ProductEntry] = {}
-        for manifest in manifests:
-            for product in manifest.products:
-                pages = product.pages or list(range(product.start_page, product.end_page + 1))
-                if not pages:
-                    continue
-                key = self._normalise_product_key(product.product)
-                if key in by_name:
-                    merged_pages = sorted(set(by_name[key].pages) | set(pages))
-                    by_name[key].pages = merged_pages
-                    by_name[key].start_page = min(merged_pages)
-                    by_name[key].end_page = max(merged_pages)
-                    continue
-                by_name[key] = ProductEntry(
-                    product=product.product,
-                    start_page=min(pages),
-                    end_page=max(pages),
-                    pages=sorted(set(pages)),
-                )
+    def _heuristic_discover_products(self, pages: List[PageText]) -> ProductManifest:
+        """
+        Pure heuristic product discovery when the LLM call fails.
 
-        return ProductManifest(
-            products=sorted(by_name.values(), key=lambda p: p.start_page)
-        )
+        Finds top-level numbered headings (depth 1) and treats each as a
+        product section. Page range is determined by the span until the
+        next sibling heading.
+        """
+        # Collect all (page_number, depth, heading_text) triples
+        all_headings: List[Tuple[int, int, str]] = []
+        for p in pages:
+            for raw_line in p.text.splitlines():
+                line = raw_line.strip()
+                is_heading, depth = self._is_heading_line(line)
+                if is_heading and depth >= 1:
+                    all_headings.append((p.page_number, depth, line))
+
+        if not all_headings:
+            return ProductManifest(products=[])
+
+        # Determine the minimum depth among found headings — that's the product level
+        min_depth = min(d for _, d, _ in all_headings)
+
+        # Filter to top-level headings only
+        top_headings = [(pg, txt) for pg, d, txt in all_headings if d == min_depth]
+
+        if not top_headings:
+            return ProductManifest(products=[])
+
+        total_pages = max(p.page_number for p in pages)
+        products: List[ProductEntry] = []
+
+        for idx, (pg, txt) in enumerate(top_headings):
+            next_pg = top_headings[idx + 1][0] - 1 if idx + 1 < len(top_headings) else total_pages
+            next_pg = max(pg, next_pg)
+
+            page_set = list(range(pg, next_pg + 1))
+
+            if self._is_junk_product_name(txt):
+                continue
+
+            products.append(ProductEntry(
+                product    = txt,
+                start_page = pg,
+                end_page   = next_pg,
+                pages      = page_set,
+            ))
+
+        return ProductManifest(products=products)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # PHASE 2 – PRODUCT-SPECIFIC REQUIREMENT EXTRACTION
+    # ──────────────────────────────────────────────────────────────────────────
 
     def extract_for_product(
         self,
@@ -600,42 +467,40 @@ RFP PAGE DIGEST:
 
         Steps
         -----
-        1. Slice pages to [start_page, end_page].
+        1. Slice pages to the product's page set.
         2. Run regex pass over sliced text (zero API calls).
         3. Chunk sliced pages, run LLM extraction in parallel.
         4. Merge, deduplicate, assign IDs.
         """
-        page_scope = product.pages or list(range(product.start_page, product.end_page + 1))
+        page_scope     = product.pages or list(range(product.start_page, product.end_page + 1))
         page_scope_set = set(page_scope)
-        print(f"\n=== EXTRACTING: {product.product} "
-              f"(pages {ProductManifest._format_pages(page_scope)}) ===")
+        print(f"\n=== EXTRACTING: {product.product} ===")
+        print(f"    Pages: {ProductManifest._format_pages(page_scope)}")
 
         # Step 1: slice to product pages
-        product_pages = [
-            p for p in pages
-            if p.page_number in page_scope_set
-        ]
+        product_pages = [p for p in pages if p.page_number in page_scope_set]
         if not product_pages:
             logger.warning(f"No pages found for {product.product}")
             return []
 
         total_chars = sum(len(p.text) for p in product_pages)
-        print(f"Pages in scope: {len(product_pages)}  |  Chars: {total_chars}")
+        print(f"    {len(product_pages)} pages  |  {total_chars:,} chars")
 
         # Step 2: regex pass (no API call)
         regex_reqs = self._regex_pass(product_pages, product.product)
-        print(f"Regex requirements: {len(regex_reqs)}")
+        print(f"    Regex hits: {len(regex_reqs)}")
 
         # Step 3: LLM extraction in parallel
         chunks = self._chunk_pages(product_pages)
-        print(f"LLM chunks: {len(chunks)}  (parallel, max {MAX_WORKERS} workers)")
+        workers = min(len(chunks), MAX_WORKERS)
+        print(f"    LLM chunks: {len(chunks)}  (max {workers} parallel workers)")
         llm_reqs = self._llm_extract_parallel(chunks, product.product)
-        print(f"LLM requirements (raw): {len(llm_reqs)}")
+        print(f"    LLM requirements (raw): {len(llm_reqs)}")
 
         # Step 4: merge, dedup, assign IDs
         all_reqs = self._deduplicate(regex_reqs + llm_reqs)
         self._assign_ids(all_reqs)
-        print(f"Final requirements (after dedup): {len(all_reqs)}")
+        print(f"    Final (after dedup): {len(all_reqs)}")
         return all_reqs
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -660,9 +525,9 @@ RFP PAGE DIGEST:
         def flush():
             nonlocal chunk_idx, current_texts, current_len, chunk_first, chunk_last
             if current_texts:
-                label = f"Chunk-{chunk_idx} (pp.{chunk_first}-{chunk_last})"
+                label = f"Chunk-{chunk_idx} (pp.{chunk_first}–{chunk_last})"
                 chunks.append((label, chunk_first, chunk_last, "\n\n".join(current_texts)))
-                chunk_idx += 1
+                chunk_idx    += 1
                 current_texts = []
                 current_len   = 0
 
@@ -697,15 +562,15 @@ RFP PAGE DIGEST:
                 if not match:
                     continue
                 results.append(Requirement(
-                    requirement_id="",
-                    category=product,
-                    requirement=match.group("metric").strip(),
-                    source_text=sentence.strip(),
-                    mandatory=self._is_mandatory(sentence),
-                    operator=">=",
-                    value=match.group("value"),
-                    unit=match.group("unit"),
-                    section=f"Page {page.page_number}",
+                    requirement_id = "",
+                    category       = product,
+                    requirement    = match.group("metric").strip(),
+                    source_text    = sentence.strip(),
+                    mandatory      = self._is_mandatory(sentence),
+                    operator       = ">=",
+                    value          = match.group("value"),
+                    unit           = match.group("unit"),
+                    section        = f"Page {page.page_number}",
                 ))
         return results
 
@@ -732,7 +597,7 @@ RFP PAGE DIGEST:
                 label = futures[future]
                 try:
                     reqs = future.result()
-                    print(f"  {label}: {len(reqs)} requirements")
+                    print(f"    {label}: {len(reqs)} requirements")
                     all_reqs.extend(reqs)
                 except Exception as exc:
                     logger.warning(f"Chunk {label} failed: {exc}")
@@ -747,65 +612,76 @@ RFP PAGE DIGEST:
         text: str,
         product: str,
     ) -> List[Requirement]:
-        prompt = f"""You are an RFP analyst extracting requirements for: {product}
+        prompt = f"""You are an RFP analyst extracting technical requirements for: {product}
 
-The text below comes from pages {first_page}–{last_page} of the RFP.
-Each page is marked with [Page N] at the start.
+The text below comes from pages {first_page}–{last_page} of an RFP.
+Each page is delimited by [Page N].
 
-Extract EVERY requirement — quantitative and qualitative.
+Extract EVERY requirement stated in the text — both quantitative and qualitative.
 Include: performance specs, capacity thresholds, feature support, compliance mandates,
-         deployment constraints, integration requirements, operational requirements.
+         deployment constraints, integration requirements, operational requirements,
+         interface requirements, security requirements, environmental requirements.
 
-Return ONLY a JSON array. No markdown, no code fences, no explanation.
+Rules:
+- Do NOT skip any requirement, even if it seems minor.
+- Each requirement must be a standalone, self-contained statement.
+- Do NOT invent requirements that are not in the text.
+- Preserve exact numeric values and units from the source.
+
+Return ONLY a valid JSON array. No markdown, no code fences, no explanation, no preamble.
 
 Each object must have exactly these keys:
   "requirement"  – concise, self-contained requirement statement (string)
-  "category"     – the sub-topic or functional area within {product} that this
-                   requirement belongs to (e.g. "Performance", "High Availability",
-                   "Logging", "Authentication") — derive it from the text, do not
-                   invent or map to an external taxonomy
-  "mandatory"    – true if the text uses shall/must/mandatory/required, else false
+  "category"     – functional sub-area within {product} (e.g. "Performance", "HA",
+                   "Logging", "Authentication") — derive from the text
+  "mandatory"    – true if text uses shall/must/mandatory/required, else false
   "source_text"  – the exact sentence(s) from the document (preserve original wording)
-  "page_number"  – the [Page N] number where this requirement appears (integer)
-  "operator"     – ">=" for numeric thresholds, "supports" for feature/capability requirements
-  "value"        – numeric threshold as string (e.g. "10"), or "true" for feature requirements
+  "page_number"  – page number where this requirement appears (integer)
+  "operator"     – ">=" for numeric thresholds, "supports" for feature requirements
+  "value"        – numeric threshold as string (e.g. "10"), or "true" for feature reqs
   "unit"         – unit for numeric specs: Gbps/Mbps/TB/GB/MB/Users/Sessions/EPS — or null
 
 TEXT:
 {text}
 """
 
+        response = ""
         try:
             response = llm.generate(prompt, max_tokens=6000)
-            response = self._clean_llm_response(response)
-            data = self._loads_json(response)
+            cleaned  = self._clean_llm_response(response)
+
+            if not cleaned.strip():
+                raise ValueError("LLM returned empty response after cleaning")
+
+            data = self._loads_json(cleaned)
 
             if not isinstance(data, list):
-                raise ValueError(f"Expected list, got {type(data)}")
+                raise ValueError(f"Expected list, got {type(data).__name__}")
 
             results: List[Requirement] = []
             for item in data:
                 if not isinstance(item, dict) or not item.get("requirement"):
                     continue
-                # Determine section label from returned page_number if present
-                pg = item.get("page_number")
+                pg      = self._safe_int(item.get("page_number"))
                 section = f"Page {pg}" if pg else chunk_label
 
                 results.append(Requirement(
-                    requirement_id="",
-                    category=item.get("category", product),
-                    requirement=str(item["requirement"]).strip(),
-                    source_text=item.get("source_text", ""),
-                    mandatory=bool(item.get("mandatory", True)),
-                    operator=item.get("operator", "supports"),
-                    value=str(item.get("value", "true")),
-                    unit=item.get("unit") or None,
-                    section=section,
+                    requirement_id = "",
+                    category       = str(item.get("category", product)).strip() or product,
+                    requirement    = str(item["requirement"]).strip(),
+                    source_text    = str(item.get("source_text", "")).strip(),
+                    mandatory      = bool(item.get("mandatory", True)),
+                    operator       = str(item.get("operator", "supports")),
+                    value          = str(item.get("value", "true")),
+                    unit           = item.get("unit") or None,
+                    section        = section,
                 ))
             return results
 
         except Exception as exc:
             logger.warning(f"LLM extraction failed for {chunk_label}: {exc}")
+            if response:
+                logger.debug(f"Raw response (first 300): {response[:300]!r}")
             return []
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -813,33 +689,18 @@ TEXT:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _is_junk_product_name(self, name: str) -> bool:
-        """
-        Return True if `name` looks like noise rather than a real product section
-        heading.  Used as a post-parse guard after the LLM response is parsed.
-
-        Rejects:
-          - Empty or very short strings (< 3 chars after stripping)
-          - Single-token strings that are all-digits, units, or abbreviations
-          - Strings that contain measurement patterns (e.g. "45 M", "3.5 GHz")
-          - Strings that are clearly URLs or file paths
-        """
+        """Return True if `name` looks like noise rather than a real product heading."""
         if not name or len(name.strip()) < 3:
             return True
-
-        # URL / path
         if any(c in name for c in ("://", "\\", ".com", ".org", ".pdf")):
             return True
 
         tokens = name.split()
-
-        # Single token: reject if it's a pure number, known unit, or ≤ 3 chars
         if len(tokens) == 1:
             t = tokens[0].upper()
             if t in self._UNIT_WORDS or t.replace(".", "").isdigit() or len(t) <= 3:
                 return True
 
-        # Measurement pattern: a number followed by a unit token
-        # e.g. "45 M", "3.5 GHz", "100 Mbps"
         _UNIT_TOKENS = self._UNIT_WORDS | {
             "M", "K", "G", "T", "GHZ", "MHZ", "MBPS", "GBPS",
             "MS", "S", "KB", "MB", "GB", "TB",
@@ -849,34 +710,43 @@ TEXT:
                 if tokens[i + 1].upper() in _UNIT_TOKENS:
                     return True
 
-        # Must contain at least one letter (rules out "45", "3.5", "II")
         if not any(c.isalpha() for c in name):
             return True
-
-        # Must have at least 2 letters total
         if sum(1 for c in name if c.isalpha()) < 2:
             return True
 
         return False
 
     def _clean_llm_response(self, response: str) -> str:
+        """Strip <think> blocks, code fences, and leading/trailing whitespace."""
+        # Remove <think>...</think> blocks (reasoning models)
         response = self._THINK_RE.sub("", response).strip()
+        # Remove opening ```json or ``` fences
         response = self._FENCE_OPEN_RE.sub("", response).strip()
+        # Remove closing ``` fences
         response = self._FENCE_CLOSE_RE.sub("", response).strip()
         return response
 
     def _loads_json(self, response: str) -> Any:
         """
-        Parse LLM JSON robustly. Some models still wrap valid JSON in short
-        prefaces or trailing notes despite strict prompts.
+        Parse LLM JSON robustly.
+        Tries direct parse first, then hunts for the first JSON array or object.
         """
+        # Direct parse
         try:
             return json.loads(response)
         except json.JSONDecodeError:
-            match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", response)
-            if not match:
-                raise
-            return json.loads(match.group(1))
+            pass
+
+        # Hunt for a JSON array or object in the response
+        match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", response)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        raise ValueError(f"No valid JSON found in response. First 200 chars: {response[:200]!r}")
 
     def _coerce_page_list(self, item: dict, total_pages: int) -> List[int]:
         raw_pages = item.get("pages", [])
@@ -912,10 +782,11 @@ TEXT:
         return re.split(r"(?<=[.!?])\s+", text)
 
     def _deduplicate(self, reqs: List[Requirement]) -> List[Requirement]:
-        seen: set = set()
+        seen:   set              = set()
         unique: List[Requirement] = []
         for req in reqs:
-            key = (req.requirement.lower().strip(), req.category)
+            # Normalise to catch near-duplicates from regex + LLM overlap
+            key = (req.requirement.lower().strip(), req.category.lower().strip())
             if key not in seen:
                 seen.add(key)
                 unique.append(req)
@@ -924,3 +795,11 @@ TEXT:
     def _assign_ids(self, reqs: List[Requirement]) -> None:
         for i, req in enumerate(reqs, start=1):
             req.requirement_id = f"REQ-{i:04}"
+
+    @staticmethod
+    def _safe_int(val: Any) -> int:
+        """Convert val to int safely; return 0 on failure."""
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return 0

@@ -137,7 +137,7 @@ class PipelineConfig:
     log_level: str = "INFO"
 
     use_llm_for_model_id: bool = True
-    llm_model: str = "qwen3:14b"
+    llm_model: str = "qwen3:8b"
     llm_api_key: str = field(
         default_factory=lambda: os.getenv("LLM_API_KEY", "local")
     )
