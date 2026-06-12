@@ -41,26 +41,6 @@ What changed vs. the previous version
 
 Everything still uses the single `llm` object from services.llm_services —
 no second model / provider is introduced anywhere.
-
-What changed in this revision (v3)
------------------------------------
-- Chunking is now paragraph/section-aware (`_split_into_units` /
-  `_split_oversized`): chunk boundaries fall on blank lines or detected
-  section headings instead of mid-paragraph, and CLASS_CHUNK_SIZE /
-  CHUNK_SIZE were raised to 3000 / 5000 chars.
-- The extraction prompt now includes a worked few-shot example and
-  explicit "testable assertion" criteria for what counts as a real
-  requirement vs. boilerplate.
-- New `_is_valid_requirement()` filters garbage (too-short fragments,
-  boilerplate, malformed numeric values) from BOTH the regex and LLM
-  passes, and as a final pass in `extract_for_category`.
-- Requirement embeddings now use bge-m3 via Ollama
-  (`services.embedding_service`) — the SAME model/endpoint as the OEM
-  datasheet KB used by the compliance scorer.
-- `Requirement.to_safe_dict()` replaces bare `.dict()` calls (Pydantic v2).
-- Requirement IDs are now category-prefixed (e.g. NGFW-0001, ADC-0001)
-  instead of a flat REQ-0001 sequence shared across products.
-- Per-category and overall pipeline timing is printed via `time.monotonic()`.
 """
 
 from __future__ import annotations
@@ -69,23 +49,20 @@ import json
 import logging
 import os
 import re
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import fitz
-from config.settings import DEFAULT_CONFIG
 from models.schemas import Requirement
-from services.embedding_service import ChromaBGEM3EmbeddingFunction
 from services.llm_services import llm
 from rfp.taxonomy import CATEGORY_TAXONOMY          # ← keyword taxonomy
 
 logger = logging.getLogger(__name__)
 
 # ── tunables ───────────────────────────────────────────────────────────────────
-CHUNK_SIZE        = 5000   # chars per chunk for requirement EXTRACTION
-CLASS_CHUNK_SIZE  = 3000   # chars per chunk for CLASSIFICATION
+CHUNK_SIZE        = 2500   # chars per chunk for requirement EXTRACTION
+CLASS_CHUNK_SIZE  = 1500   # chars per chunk for CLASSIFICATION
 
 # NOTE on MAX_WORKERS: this assumes a single LOCAL, CPU-ONLY LLM (e.g. Ollama /
 # llama.cpp on an office workstation with no GPU). Such servers process one
@@ -100,23 +77,18 @@ CLASS_CHUNK_SIZE  = 3000   # chars per chunk for CLASSIFICATION
 # for N concurrent slots, you can raise this to match N — but do not exceed it.
 MAX_WORKERS       = 2
 
-EXTRACT_MAX_TOKENS = 6144   # generous headroom so JSON arrays aren't truncated
-                            # (larger CHUNK_SIZE → more requirements per call)
+EXTRACT_MAX_TOKENS = 4096   # generous headroom so JSON arrays aren't truncated
 CLASSIFY_MAX_TOKENS = 30
 
 MIN_SCORE         = 3       # minimum taxonomy score to accept a category at all
 STRONG_SCORE      = 4       # score that counts as a "confident" single-chunk match
 MIN_CHUNKS_FOR_PRODUCT = 2  # categories below STRONG_SCORE need >= this many chunks
 
-# Requirement validation thresholds (see _is_valid_requirement)
-MIN_REQUIREMENT_CHARS = 8   # below this, a "requirement" is almost certainly
-                            # a stray header/page-number/fragment, not a real
-                            # requirement statement.
-
 # ── output / vector store paths ─────────────────────────────────────────────
-OUTPUT_JSON_PATH   = DEFAULT_CONFIG.paths.requirements_json
-CHROMA_DB_PATH     = DEFAULT_CONFIG.paths.chroma_db_path
-CHROMA_COLLECTION  = DEFAULT_CONFIG.paths.chroma_collection
+OUTPUT_JSON_PATH   = "data/requirements.json"
+CHROMA_DB_PATH     = "data/chroma_db"
+CHROMA_COLLECTION  = "rfp_requirements"
+EMBEDDING_MODEL    = "all-MiniLM-L6-v2"   # small, fast, CPU-friendly
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -301,27 +273,6 @@ class RFPRequirementExtractor:
     _FENCE_OPEN_RE  = re.compile(r"^```(?:json)?\s*",   re.MULTILINE)
     _FENCE_CLOSE_RE = re.compile(r"```\s*$",            re.MULTILINE)
 
-    # Generic boilerplate that LLMs occasionally surface as "requirements"
-    # but which is not a testable product requirement.
-    _BOILERPLATE_RE = re.compile(
-        r"\b(?:comply with (?:all|the)?\s*terms|see appendix|"
-        r"table of contents|vendor shall comply|terms and conditions of "
-        r"this rfp|page \d+ of \d+|this page (?:is|was) intentionally "
-        r"(?:left )?blank)\b",
-        re.IGNORECASE,
-    )
-
-    # A line that LOOKS like a section/sub-section heading:
-    #   "3.2 Firewall Requirements", "SECTION 4", "ANNEX A", "TABLE 2",
-    #   or a short ALL-CAPS heading line ("NETWORK SECURITY REQUIREMENTS").
-    _SECTION_HEADING_RE = re.compile(
-        r"^\s*(?:"
-        r"\d+(?:\.\d+){0,4}\.?\s+\S"                              # 3.2 Foo
-        r"|(?:SECTION|CHAPTER|ANNEX|APPENDIX|PART|TABLE|FIGURE)\s+[\dIVXA-Z]"
-        r"|[A-Z][A-Z0-9 /&,\-]{4,}\s*$"                            # ALL CAPS HEADING
-        r")",
-    )
-
     def __init__(self):
         self._classifier = TaxonomyClassifier()
 
@@ -403,15 +354,7 @@ class RFPRequirementExtractor:
     ) -> List[Tuple[List[int], str]]:
         """
         Pack pages into text chunks of <= chunk_size chars.
-
-        Unlike a naive "one page = one unit" pack, this splits each page's
-        text into paragraph/section units first (see
-        `_split_into_units`), so a chunk boundary preferentially falls on
-        a blank line or a heading line rather than mid-paragraph. Multiple
-        small sections/pages are still packed together up to `chunk_size`;
-        a single oversized section is hard-split on sentence boundaries
-        (see `_split_oversized`) so no chunk ever exceeds `chunk_size`.
-
+        Never splits a single page across two chunks.
         Returns list of (page_numbers, text).
         """
         chunks:    List[Tuple[List[int], str]] = []
@@ -421,107 +364,21 @@ class RFPRequirementExtractor:
 
         def flush():
             if buf_texts:
-                # de-dupe while preserving order
-                seen: set = set()
-                pages_out: List[int] = []
-                for p in buf_pages:
-                    if p not in seen:
-                        seen.add(p)
-                        pages_out.append(p)
-                chunks.append((pages_out, "\n\n".join(buf_texts)))
+                chunks.append((list(buf_pages), "\n\n".join(buf_texts)))
                 buf_texts.clear()
                 buf_pages.clear()
 
         for page in pages:
-            units = self._split_into_units(page.text)
-            if not units:
-                continue
-
-            for i, unit in enumerate(units):
-                piece_text = f"[Page {page.page_number}]\n{unit}" if i == 0 else unit
-
-                for piece in self._split_oversized(piece_text, chunk_size):
-                    if buf_len + len(piece) > chunk_size and buf_texts:
-                        flush()
-                        buf_len = 0
-                    buf_texts.append(piece)
-                    buf_pages.append(page.page_number)
-                    buf_len += len(piece)
+            tagged = f"[Page {page.page_number}]\n{page.text.strip()}"
+            if buf_len + len(tagged) > chunk_size and buf_texts:
+                flush()
+                buf_len = 0
+            buf_texts.append(tagged)
+            buf_pages.append(page.page_number)
+            buf_len += len(tagged)
 
         flush()
         return chunks
-
-    def _split_into_units(self, text: str) -> List[str]:
-        """
-        Split a page's text into paragraph / section units.
-
-        A new unit starts at:
-          - a blank line (standard paragraph break), or
-          - a line that LOOKS like a section/sub-section heading
-            (`_SECTION_HEADING_RE`), even if not preceded by a blank line.
-
-        This keeps related sentences together while giving the packer in
-        `_build_raw_chunks` natural places to break a chunk.
-        """
-        text = text.strip()
-        if not text:
-            return []
-
-        lines = text.split("\n")
-        units: List[str] = []
-        current: List[str] = []
-
-        for line in lines:
-            stripped = line.strip()
-
-            if not stripped:
-                if current:
-                    units.append("\n".join(current).strip())
-                    current = []
-                continue
-
-            if current and self._SECTION_HEADING_RE.match(line):
-                units.append("\n".join(current).strip())
-                current = [line]
-                continue
-
-            current.append(line)
-
-        if current:
-            units.append("\n".join(current).strip())
-
-        return [u for u in units if u]
-
-    def _split_oversized(self, text: str, chunk_size: int) -> List[str]:
-        """
-        If `text` already fits within `chunk_size`, return it unchanged.
-        Otherwise split it on sentence boundaries into pieces that each
-        fit, falling back to a hard character split for any single
-        sentence that is itself longer than `chunk_size`.
-        """
-        if len(text) <= chunk_size:
-            return [text]
-
-        pieces: List[str] = []
-        current = ""
-        for sentence in self._split_sentences(text):
-            if current and len(current) + 1 + len(sentence) > chunk_size:
-                pieces.append(current)
-                current = sentence
-            else:
-                current = f"{current} {sentence}".strip() if current else sentence
-        if current:
-            pieces.append(current)
-
-        final: List[str] = []
-        for piece in pieces:
-            if len(piece) <= chunk_size:
-                final.append(piece)
-            else:
-                for j in range(0, len(piece), chunk_size):
-                    final.append(piece[j:j + chunk_size])
-        return final or [text[:chunk_size]]
-
 
     # ── LLM fallback classifier ────────────────────────────────────────────────
 
@@ -594,14 +451,13 @@ TEXT:
         1. Retrieve chunks labelled with `category` from the store.
         2. Run regex pass (zero API calls).
         3. Run parallel LLM extraction over the selected chunks.
-        4. Merge, deduplicate, validate, assign category-prefixed IDs.
+        4. Merge, deduplicate, assign IDs.
         """
         matched = store.chunks_for(category)
         if not matched:
             logger.warning(f"No chunks found for category: {category}")
             return []
 
-        start_time = time.monotonic()
         print(f"\n=== EXTRACTING: {category} ===")
         print(f"    Chunks: {len(matched)}")
 
@@ -615,18 +471,8 @@ TEXT:
         print(f"    LLM requirements (raw): {len(llm_reqs)}")
 
         all_reqs = self._deduplicate(regex_reqs + llm_reqs)
-
-        before_validation = len(all_reqs)
-        all_reqs = [r for r in all_reqs if self._is_valid_requirement(r)]
-        dropped = before_validation - len(all_reqs)
-        if dropped:
-            print(f"    Dropped as invalid/boilerplate: {dropped}")
-
-        self._assign_ids(all_reqs, category)
-
-        elapsed = time.monotonic() - start_time
-        print(f"    Final (after dedup + validation): {len(all_reqs)}")
-        print(f"    Time for {category}: {elapsed:.1f}s")
+        self._assign_ids(all_reqs)
+        print(f"    Final (after dedup): {len(all_reqs)}")
         return all_reqs
 
     def _repack_for_extraction(
@@ -696,7 +542,7 @@ TEXT:
                     # usable rather than discarded.
                     metric = f"{unit} capacity"
                 first_page = chunk.pages[0] if chunk.pages else 0
-                req = Requirement(
+                results.append(Requirement(
                     requirement_id = "",
                     category       = product,
                     requirement    = metric,
@@ -706,9 +552,7 @@ TEXT:
                     value          = value,
                     unit           = unit,
                     section        = f"Page {first_page}",
-                )
-                if self._is_valid_requirement(req):
-                    results.append(req)
+                ))
         return results
 
 
@@ -748,44 +592,23 @@ TEXT:
 The text below comes from pages {first_page}-{last_page} of an RFP / datasheet.
 Each page is delimited by [Page N].
 
-GOAL
-Extract EVERY requirement stated in the text as a TESTABLE ASSERTION — a
-statement that a reviewer could check against a vendor datasheet and mark
-PASS or FAIL with no further interpretation. Cover both quantitative and
-qualitative requirements: performance specs, capacity thresholds, feature
-support, compliance mandates, deployment constraints, integration
-requirements, operational requirements, interface requirements, security
-requirements, environmental requirements.
+Extract EVERY requirement stated in the text — both quantitative and qualitative.
+Include: performance specs, capacity thresholds, feature support, compliance mandates,
+         deployment constraints, integration requirements, operational requirements,
+         interface requirements, security requirements, environmental requirements.
 
-WHAT MAKES A GOOD "TESTABLE ASSERTION"
-- It names ONE specific subject/metric (e.g. "IPS throughput", "SSL VPN
-  concurrent users", "support for BGP routing").
-- For quantitative requirements, it states the operator, numeric value,
-  and unit explicitly (e.g. ">= 10 Gbps").
-- For qualitative/feature requirements, it states what must be supported
-  or true, phrased so "Yes/No/Partial" is a sufficient verdict
-  (e.g. "The appliance shall support active/active high availability.").
-- It does NOT bundle multiple unrelated requirements into one sentence —
-  split compound requirements ("The system shall support X, Y and Z")
-  into separate entries, one per testable claim.
-- It does NOT restate generic filler ("the vendor shall comply with this
-  RFP", "see Appendix A") — these are NOT testable assertions and must be
-  skipped.
-
-RULES
-- Do NOT skip any real requirement, even if it seems minor.
+Rules:
+- Do NOT skip any requirement, even if it seems minor.
+- Each requirement must be a standalone, self-contained statement.
 - Do NOT invent requirements that are not in the text.
 - Preserve exact numeric values and units from the source.
 - Return a JSON ARRAY directly (not wrapped in any other object/key).
 - Return ONLY valid JSON. No markdown, no code fences, no explanation, no preamble.
 - Keep each "source_text" short (one sentence). Do not pad output — be concise so the
   full array fits in the response.
-- If the text contains NO real requirements (e.g. it is a cover page, table
-  of contents, or boilerplate), return an empty array: []
 
-OUTPUT SCHEMA
 Each object must have exactly these keys:
-  "requirement"  - concise, self-contained, testable requirement statement (string)
+  "requirement"  - concise, self-contained requirement statement (string)
   "category"     - functional sub-area within {product} (e.g. "Performance", "HA",
                    "Logging", "Authentication") - derive from the text
   "mandatory"    - true if text uses shall/must/mandatory/required, else false
@@ -794,66 +617,6 @@ Each object must have exactly these keys:
   "operator"     - ">=" for numeric thresholds, "supports" for feature requirements
   "value"        - numeric threshold as string (e.g. "10"), or "true" for feature reqs
   "unit"         - unit for numeric specs: Gbps/Mbps/TB/GB/MB/Users/Sessions/EPS - or null
-
-EXAMPLE
-
-Example input text:
-  [Page 14]
-  3.4 Firewall Performance
-  The proposed NGFW shall provide a minimum firewall throughput of 40 Gbps
-  and threat prevention throughput of at least 10 Gbps. The appliance must
-  support active/active and active/passive high availability modes. SSL VPN
-  shall support a minimum of 2000 concurrent users. Vendor shall comply with
-  all terms of this RFP.
-
-Example output:
-[
-  {{
-    "requirement": "Firewall throughput >= 40 Gbps",
-    "category": "Performance",
-    "mandatory": true,
-    "source_text": "The proposed NGFW shall provide a minimum firewall throughput of 40 Gbps",
-    "page_number": 14,
-    "operator": ">=",
-    "value": "40",
-    "unit": "Gbps"
-  }},
-  {{
-    "requirement": "Threat prevention throughput >= 10 Gbps",
-    "category": "Performance",
-    "mandatory": true,
-    "source_text": "threat prevention throughput of at least 10 Gbps",
-    "page_number": 14,
-    "operator": ">=",
-    "value": "10",
-    "unit": "Gbps"
-  }},
-  {{
-    "requirement": "Appliance supports active/active and active/passive high availability",
-    "category": "HA",
-    "mandatory": true,
-    "source_text": "The appliance must support active/active and active/passive high availability modes.",
-    "page_number": 14,
-    "operator": "supports",
-    "value": "true",
-    "unit": null
-  }},
-  {{
-    "requirement": "SSL VPN concurrent users >= 2000",
-    "category": "VPN",
-    "mandatory": true,
-    "source_text": "SSL VPN shall support a minimum of 2000 concurrent users.",
-    "page_number": 14,
-    "operator": ">=",
-    "value": "2000",
-    "unit": "Users"
-  }}
-]
-
-Note: "Vendor shall comply with all terms of this RFP" was correctly
-SKIPPED — it is generic boilerplate, not a testable product requirement.
-
-Now extract from the following text. Return ONLY the JSON array.
 
 TEXT:
 {text}
@@ -901,7 +664,7 @@ TEXT:
             pg      = self._safe_int(item.get("page_number"))
             section = f"Page {pg}" if pg else chunk_label
 
-            req = Requirement(
+            results.append(Requirement(
                 requirement_id = "",
                 category       = str(item.get("category", product)).strip() or product,
                 requirement    = str(item["requirement"]).strip(),
@@ -911,9 +674,7 @@ TEXT:
                 value          = str(item.get("value", "true")),
                 unit           = item.get("unit") or None,
                 section        = section,
-            )
-            if self._is_valid_requirement(req):
-                results.append(req)
+            ))
         return results
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1036,42 +797,6 @@ TEXT:
         return response
 
     # ──────────────────────────────────────────────────────────────────────────
-    # REQUIREMENT VALIDATION  (filter garbage from regex + LLM passes)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _is_valid_requirement(self, req: Requirement) -> bool:
-        """
-        Reject entries that aren't real, testable requirements:
-          - too short to be meaningful (stray fragments, page numbers,
-            lone bullet markers)
-          - no alphabetic content (pure numbers/punctuation)
-          - generic RFP boilerplate ("comply with all terms of this RFP",
-            "see Appendix A", "Table of Contents", ...)
-          - numeric requirements where "value" isn't actually numeric
-            (a malformed LLM response)
-        """
-        text = (req.requirement or "").strip()
-
-        if len(text) < MIN_REQUIREMENT_CHARS:
-            return False
-
-        if not re.search(r"[A-Za-z]{3,}", text):
-            return False
-
-        if self._BOILERPLATE_RE.search(text):
-            return False
-        if req.source_text and self._BOILERPLATE_RE.search(req.source_text):
-            return False
-
-        if req.operator == ">=" and req.unit:
-            try:
-                float(req.value)
-            except (TypeError, ValueError):
-                return False
-
-        return True
-
-    # ──────────────────────────────────────────────────────────────────────────
     # HELPERS
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -1152,18 +877,9 @@ TEXT:
 
         return unique
 
-    def _assign_ids(self, reqs: List[Requirement], category: str) -> None:
-        """
-        Assign category-prefixed, sequential IDs, e.g. NGFW-0001, NGFW-0002.
-
-        The prefix is derived from the PRODUCT category passed to
-        `extract_for_category` (not `req.category`, which is the
-        functional sub-area like "Performance" / "HA"), so all
-        requirements for one product share one ID namespace.
-        """
-        prefix = re.sub(r"[^A-Z0-9]+", "", category.upper()).strip("_") or "REQ"
+    def _assign_ids(self, reqs: List[Requirement]) -> None:
         for i, req in enumerate(reqs, start=1):
-            req.requirement_id = f"{prefix}-{i:04d}"
+            req.requirement_id = f"REQ-{i:04d}"
 
     @staticmethod
     def _safe_int(val: Any) -> int:
@@ -1197,21 +913,22 @@ TEXT:
           - metadata:  category, requirement_id, mandatory, operator,
                        value, unit, section, source_file, source_text
 
-        Uses bge-m3 via Ollama (`services.embedding_service`) — the SAME
-        embedding model/endpoint used for the OEM datasheet KB, so the
-        compliance scorer's vector search compares like with like.
+        Uses sentence-transformers locally (CPU) via Chroma's default
+        embedding function — no external API calls, safe for an
+        air-gapped/offline workstation.
 
-        Returns the number of requirements embedded. If chromadb isn't
-        installed, or the Ollama embedding endpoint is unreachable, logs a
-        warning and returns 0 without failing the whole pipeline — the
-        JSON file is still written.
+        Returns the number of requirements embedded. If chromadb (or the
+        embedding deps) aren't installed, logs a warning and returns 0
+        without failing the whole pipeline — the JSON file is still written.
         """
         try:
             import chromadb
+            from chromadb.utils import embedding_functions
         except ImportError:
             logger.warning(
-                "chromadb not installed — skipping vector store embedding. "
-                "Install with: pip install chromadb"
+                "chromadb (or its deps) not installed — skipping vector "
+                "store embedding. Install with: pip install chromadb "
+                "sentence-transformers"
             )
             return 0
 
@@ -1224,17 +941,14 @@ TEXT:
             print("\nNo requirements to embed.")
             return 0
 
-        embed_fn = ChromaBGEM3EmbeddingFunction()
-        if not embed_fn._service.ping():
-            logger.warning(
-                f"bge-m3 embedding endpoint at {embed_fn._service.base_url} "
-                "is unreachable — skipping vector store embedding. The "
-                "JSON file has still been written."
-            )
-            return 0
-
         os.makedirs(chroma_path, exist_ok=True)
         client = chromadb.PersistentClient(path=chroma_path)
+
+        # all-MiniLM-L6-v2: ~80MB, runs comfortably on CPU, good default
+        # for short requirement-style sentences.
+        embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=EMBEDDING_MODEL
+        )
 
         collection = client.get_or_create_collection(
             name=collection_name,
@@ -1299,7 +1013,6 @@ TEXT:
 
         Returns the same dict that gets written to disk.
         """
-        pipeline_start = time.monotonic()
         pages = self.extract_pages(pdf_path)
         store = self.chunk_and_classify(pages)
 
@@ -1321,7 +1034,7 @@ TEXT:
                 "category":          cat,
                 "page_range":        {"start": start, "end": end},
                 "requirement_count": len(reqs),
-                "requirements":      [r.to_safe_dict() for r in reqs],
+                "requirements":      [r.dict() for r in reqs],
             })
 
         out_dir = os.path.dirname(output_json_path)
@@ -1337,9 +1050,5 @@ TEXT:
             self._embed_requirements_into_chroma(
                 result, chroma_path=chroma_path, collection_name=chroma_collection,
             )
-
-        total_elapsed = time.monotonic() - pipeline_start
-        print(f"\n=== DONE in {total_elapsed:.1f}s "
-              f"({total_elapsed / 60:.1f} min) ===")
 
         return result
