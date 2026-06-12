@@ -13,6 +13,7 @@ load_dotenv()
 # ── Base paths ────────────────────────────────────────────────────────────────
 BASE_DIR          = Path(__file__).parent.parent
 DATA_DIR          = BASE_DIR / "data"
+requirements_json = BASE_DIR / "requirements"
 RAW_DIR           = DATA_DIR / "raw"
 PROCESSED_DIR     = DATA_DIR / "processed"
 VECTOR_STORE_DIR  = DATA_DIR / "vector_store"
