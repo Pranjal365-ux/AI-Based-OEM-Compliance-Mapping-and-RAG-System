@@ -40,7 +40,6 @@ except ImportError:
 try:
     from config.settings import ModelIdentificationConfig, PipelineConfig
     from models.schemas import ExtractedTable, ModelSpec
-    from ingestion.classifier import detect_category
 except ImportError:
     # Allow isolated testing without the full project installed
     pass
@@ -569,7 +568,6 @@ def identify_models(pages, vendor, filename, cfg):
     all_tables = [t for p in pages for t in p.get("tables", [])]
     sections = split_into_sections(pages)
 
-    category, confidence = detect_category(filename=filename, full_text=full_text)
     models = []
 
     # Stage 1: Table-based extraction
@@ -633,8 +631,6 @@ def identify_models(pages, vendor, filename, cfg):
                 model_name=mn,
                 vendor=vendor,
                 product_family=family,
-                product_category=category,
-                category_confidence=confidence,
                 specs=table_specs.get(mn, {}),  # FIX-4
                 spec_sections={"Specifications": spec_text} if spec_text else {},
                 source_pages=list(range(1, len(pages) + 1)),
@@ -655,8 +651,6 @@ def identify_models(pages, vendor, filename, cfg):
         spec_sections=_sections_to_spec_dict(sections),
         source_pages=list(range(1, len(pages) + 1)),
         extraction_confidence=0.4,
-        product_category=category,
-        category_confidence=confidence,
         identified_by="fallback_single",
     ))
     return models
@@ -774,8 +768,6 @@ def _assign_model_page_ranges(models, pages):
 
     existing_upper = {m.model_name.upper() for m in models}
     vendor = models[0].vendor if models else "Unknown"
-    category = models[0].product_category if models else "Unknown"
-    conf = models[0].category_confidence if models else 0.0
     family = models[0].product_family if models else None
 
     sub_hits: Dict[str, List[int]] = {}
@@ -793,8 +785,6 @@ def _assign_model_page_ranges(models, pages):
             model_name=sub_name,
             vendor=vendor,
             product_family=family,
-            product_category=category,
-            category_confidence=conf,
             source_pages=list(range(first, last + 1)),
             extraction_confidence=0.7,
             identified_by="submodule_detection",

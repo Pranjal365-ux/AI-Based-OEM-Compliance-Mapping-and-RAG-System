@@ -1,43 +1,40 @@
 # rfp/rfp_extractor.py
 """
-RFP Requirement Extraction Pipeline  –  Taxonomy-First Edition (fixed)
-=======================================================================
+RFP Requirement Extraction Pipeline – Page-Range Edition
+=========================================================
 
 Flow
 ----
   PDF
-   └─ extract_pages()        → List[PageText]
-   └─ chunk_and_classify()    → ChunkStore   (taxonomy first, LLM only for
-                                              chunks the taxonomy can't place)
-   └─ store.confirmed_categories()           (filters out one-off / garbage hits)
-   └─ extract_for_category()  → List[Requirement]   (regex + LLM, per category)
-   └─ run()                   → writes a single JSON file with every confirmed
-                                 product/category and its requirements
+   └─ extract_pages()                   → List[PageText]
+   └─ user selects a page range         → (start_page, end_page)
+   └─ extract_requirements_from_range() → List[Requirement]
+   └─ run()                             → writes a single JSON file with every
+                                           requirement found in that page range
 
 What changed vs. the previous version
 ---------------------------------------
-1. PRODUCT IDENTIFICATION ("garbage products")
-   - Classification now assigns each chunk to its single BEST category
-     (no more cloning one chunk into 5+ categories on weak keyword hits).
-   - A category is only reported as a real "product" if it has either
-       * >= 2 chunks classified into it, OR
-       * at least one chunk with a "strong" score (title-word + keyword hit)
-     This removes one-off incidental keyword matches (e.g. the word
-     "server" appearing once on an unrelated page).
+The previous version classified every chunk of the RFP into a product
+category (NGFW, ADC, WAF, ...) using a keyword taxonomy + LLM fallback, then
+asked the user to pick ONE category before extracting its requirements.
 
-2. LLM CALLS FAILING
-   - CHUNK_SIZE / CLASS_CHUNK_SIZE were absurdly small (500 chars), causing
-     a flood of tiny LLM calls that got truncated mid-JSON. Restored to
-     sane sizes (2500 / 1500 chars).
-   - max_tokens raised so responses aren't cut off mid-array.
-   - MAX_WORKERS raised from 1 (effectively serial + slow) to a sane default.
-   - JSON parsing is now robust:
-       * handles dict-wrapped responses (e.g. {"requirements": [...]})
-       * salvages complete JSON objects from a TRUNCATED array instead of
-         failing the whole chunk
-       * retries once (same LLM) if parsing still yields nothing.
-   - Category-classification LLM fallback now matches category names that
-     appear anywhere in the reply, not just an exact full-string match.
+That whole classification step has been removed. The new flow is:
+
+  1. The RFP is opened and split into pages.
+  2. The user picks a page range to scan (e.g. "pages 12-30" — the section
+     of the RFP that covers the product they care about).
+  3. Every requirement on those pages is extracted directly (regex pass for
+     quick numeric thresholds + LLM pass for everything else). No product
+     category is assigned to the requirement set as a whole.
+  4. The resulting requirements are written to JSON and (optionally) embedded
+     into Chroma, ready to be matched against the OEM knowledge base so the
+     best-fitting products can be found and a compliance report generated.
+
+Each individual requirement still carries a `category` field, but this is now
+just a functional grouping derived by the LLM (e.g. "Performance", "High
+Availability", "Security", "Power") — it is NOT a product-taxonomy label and
+has nothing to do with the OEM product categories (NGFW/ADC/etc.) that used
+to drive the old flow.
 
 Everything still uses the single `llm` object from services.llm_services —
 no second model / provider is introduced anywhere.
@@ -50,19 +47,17 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, List, Tuple
 
 import fitz
 from models.schemas import Requirement
 from services.llm_services import llm
-from rfp.taxonomy import CATEGORY_TAXONOMY          # ← keyword taxonomy
 
 logger = logging.getLogger(__name__)
 
 # ── tunables ───────────────────────────────────────────────────────────────────
-CHUNK_SIZE        = 2500   # chars per chunk for requirement EXTRACTION
-CLASS_CHUNK_SIZE  = 1500   # chars per chunk for CLASSIFICATION
+CHUNK_SIZE = 2500   # chars per chunk for requirement EXTRACTION
 
 # NOTE on MAX_WORKERS: this assumes a single LOCAL, CPU-ONLY LLM (e.g. Ollama /
 # llama.cpp on an office workstation with no GPU). Such servers process one
@@ -75,20 +70,15 @@ CLASS_CHUNK_SIZE  = 1500   # chars per chunk for CLASSIFICATION
 # between calls without contending for the same CPU cores running inference.
 # If your server (e.g. llama.cpp with --parallel N) is explicitly configured
 # for N concurrent slots, you can raise this to match N — but do not exceed it.
-MAX_WORKERS       = 2
+MAX_WORKERS = 1
 
 EXTRACT_MAX_TOKENS = 4096   # generous headroom so JSON arrays aren't truncated
-CLASSIFY_MAX_TOKENS = 30
-
-MIN_SCORE         = 3       # minimum taxonomy score to accept a category at all
-STRONG_SCORE      = 4       # score that counts as a "confident" single-chunk match
-MIN_CHUNKS_FOR_PRODUCT = 2  # categories below STRONG_SCORE need >= this many chunks
 
 # ── output / vector store paths ─────────────────────────────────────────────
-OUTPUT_JSON_PATH   = "data/requirements.json"
-CHROMA_DB_PATH     = "data/chroma_db"
-CHROMA_COLLECTION  = "rfp_requirements"
-EMBEDDING_MODEL    = "all-MiniLM-L6-v2"   # small, fast, CPU-friendly
+OUTPUT_JSON_PATH  = "data/requirements.json"
+CHROMA_DB_PATH    = "data/chroma_db"
+CHROMA_COLLECTION = "rfp_requirements"
+EMBEDDING_MODEL   = "all-MiniLM-L6-v2"   # small, fast, CPU-friendly
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -103,141 +93,22 @@ class PageText:
     text: str
 
 
-@dataclass
-class TextChunk:
-    """A contiguous block of text, classified to one product category."""
-    chunk_id:      str
-    text:          str
-    pages:         List[int]
-    category:      str        # taxonomy key  e.g. "ADC", "NGFW", "UNKNOWN"
-    score:         float       # classification confidence
-    classified_by: str         # "taxonomy" | "llm_fallback" | "unclassified"
-
-
-@dataclass
-class ChunkStore:
-    """All chunks from a document, indexed by category."""
-    chunks: List[TextChunk] = field(default_factory=list)
-
-    def categories(self) -> List[str]:
-        """Every distinct non-UNKNOWN category that has at least one chunk."""
-        return sorted({c.category for c in self.chunks if c.category != "UNKNOWN"})
-
-    def chunks_for(self, category: str) -> List[TextChunk]:
-        return [c for c in self.chunks if c.category == category]
-
-    def confirmed_categories(self) -> List[str]:
-        """
-        Categories that look like real products rather than incidental
-        keyword hits:
-          - at least one chunk scored >= STRONG_SCORE, OR
-          - at least MIN_CHUNKS_FOR_PRODUCT chunks classified into it
-        """
-        confirmed: List[str] = []
-        for cat in self.categories():
-            chunks = self.chunks_for(cat)
-            max_score = max((c.score for c in chunks), default=0.0)
-            if max_score >= STRONG_SCORE or len(chunks) >= MIN_CHUNKS_FOR_PRODUCT:
-                confirmed.append(cat)
-        return confirmed
-
-    def page_range_for(self, category: str) -> Tuple[int, int]:
-        pages = [p for c in self.chunks_for(category) for p in c.pages]
-        if not pages:
-            return (0, 0)
-        return (min(pages), max(pages))
-
-    def summary(self) -> str:
-        from collections import Counter
-        counts    = Counter(c.category for c in self.chunks)
-        confirmed = set(self.confirmed_categories())
-        lines = ["Chunk classification summary:", ""]
-        for cat, n in sorted(counts.items()):
-            mark = "OK" if cat in confirmed else ("--" if cat != "UNKNOWN" else "x ")
-            lines.append(f"  [{mark}] {cat:<40}  {n} chunk(s)")
-        lines.append("")
-        lines.append(f"Confirmed products: {len(confirmed)}")
-        return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAXONOMY CLASSIFIER
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TaxonomyClassifier:
-    """
-    Keyword-based classifier.  No network calls.
-
-    Scoring per category:
-      +3 per title_word match (word appears in first 200 chars of chunk)
-      +1 per keyword match    (word/phrase appears anywhere in chunk)
-      -5 per negative match   (strong negative signal)
-
-    classify() returns the SINGLE best category for a chunk (or "UNKNOWN"
-    if nothing reaches MIN_SCORE).
-    """
-
-    def __init__(self, taxonomy: Dict[str, Any] = CATEGORY_TAXONOMY):
-        self._taxonomy = taxonomy
-        self._kw_patterns:    Dict[str, List[re.Pattern]] = {}
-        self._title_patterns: Dict[str, List[re.Pattern]] = {}
-        self._neg_patterns:   Dict[str, List[re.Pattern]] = {}
-
-        for cat, spec in taxonomy.items():
-            self._kw_patterns[cat]    = [re.compile(re.escape(k), re.IGNORECASE)
-                                          for k in spec.get("keywords", [])]
-            self._title_patterns[cat] = [re.compile(re.escape(k), re.IGNORECASE)
-                                          for k in spec.get("title_words", [])]
-            self._neg_patterns[cat]   = [re.compile(re.escape(k), re.IGNORECASE)
-                                          for k in spec.get("negative", [])]
-
-    def classify(self, text: str) -> Tuple[str, float]:
-        """Return (best_category, score). score < MIN_SCORE → ('UNKNOWN', score)."""
-        title_region = text[:200]
-        best_cat, best_score = "UNKNOWN", 0.0
-
-        for cat in self._taxonomy:
-            score = 0.0
-
-            for pat in self._neg_patterns[cat]:
-                if pat.search(text):
-                    score -= 5
-
-            for pat in self._title_patterns[cat]:
-                if pat.search(title_region):
-                    score += 3
-
-            for pat in self._kw_patterns[cat]:
-                if pat.search(text):
-                    score += 1
-
-            if score > best_score:
-                best_score = score
-                best_cat   = cat
-
-        if best_score >= MIN_SCORE:
-            return best_cat, best_score
-        return "UNKNOWN", best_score
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN CLASS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RFPRequirementExtractor:
     """
-    Two-phase RFP extractor.
+    Page-range RFP extractor.
 
-    Phase 1 – Classification (taxonomy-first, LLM only for ambiguous chunks)
-        extract_pages()          →  page-wise text
-        chunk_and_classify()     →  ChunkStore
-
-    Phase 2 – Extraction  (after user selects a category)
-        extract_for_category()   →  List[Requirement]
+    extract_pages()                  →  page-wise text for the whole document
+    extract_requirements_from_range  →  every requirement found on a chosen
+                                         page range (no product classification)
 
     Convenience
-        run()                    →  writes a JSON file with all confirmed
-                                     products and their requirements.
+        run()                    →  writes a JSON file with every requirement
+                                     found in the selected page range, and
+                                     (optionally) embeds them into Chroma.
     """
 
     # Three accepted shapes, tried in order:
@@ -274,10 +145,10 @@ class RFPRequirementExtractor:
     _FENCE_CLOSE_RE = re.compile(r"```\s*$",            re.MULTILINE)
 
     def __init__(self):
-        self._classifier = TaxonomyClassifier()
+        pass
 
     # ──────────────────────────────────────────────────────────────────────────
-    # PHASE 1A – PAGE EXTRACTION
+    # PAGE EXTRACTION
     # ──────────────────────────────────────────────────────────────────────────
 
     def extract_pages(self, pdf_path: str) -> List[PageText]:
@@ -293,181 +164,48 @@ class RFPRequirementExtractor:
         print(f"Pages extracted: {len(pages)}  |  Total chars: {total_chars:,}")
         return pages
 
+    def page_count(self, pages: List[PageText]) -> int:
+        """Convenience helper so a caller can validate a chosen page range."""
+        return len(pages)
+
     # ──────────────────────────────────────────────────────────────────────────
-    # PHASE 1B – CHUNK & CLASSIFY  (taxonomy-first)
+    # REQUIREMENT EXTRACTION OVER A PAGE RANGE
     # ──────────────────────────────────────────────────────────────────────────
 
-    def chunk_and_classify(self, pages: List[PageText]) -> ChunkStore:
-        """
-        Split the document into fixed-size text chunks, then classify each
-        chunk to its single best-matching category using the keyword
-        taxonomy. Chunks the taxonomy can't place get ONE LLM call (using
-        the existing `llm`) to assign a best-guess category.
-        """
-        print("\n=== CHUNK & CLASSIFY ===")
-        raw_chunks = self._build_raw_chunks(pages, CLASS_CHUNK_SIZE)
-        print(f"Raw chunks: {len(raw_chunks)}")
-
-        store: ChunkStore = ChunkStore()
-        llm_needed: List[Tuple[int, TextChunk]] = []   # (index in store.chunks, chunk)
-
-        for idx, (pages_in_chunk, text) in enumerate(raw_chunks):
-            category, score = self._classifier.classify(text)
-            chunk = TextChunk(
-                chunk_id      = f"chunk-{idx:04d}",
-                text          = text,
-                pages         = pages_in_chunk,
-                category      = category,
-                score         = score,
-                classified_by = "taxonomy" if category != "UNKNOWN" else "pending",
-            )
-            store.chunks.append(chunk)
-            if category == "UNKNOWN":
-                llm_needed.append((len(store.chunks) - 1, chunk))
-
-        taxonomy_hits = len(raw_chunks) - len(llm_needed)
-        print(f"Taxonomy classified: {taxonomy_hits}  |  LLM fallback needed: {len(llm_needed)}")
-
-        # ── LLM fallback (only for chunks the taxonomy couldn't place) ─────────
-        if llm_needed:
-            results = self._llm_classify_batch(llm_needed)
-            for store_idx, category in results.items():
-                chunk = store.chunks[store_idx]
-                if category == "UNKNOWN":
-                    chunk.classified_by = "unclassified"
-                else:
-                    chunk.category      = category
-                    # Treat an LLM-assigned category like a MIN_SCORE taxonomy
-                    # hit: it needs corroboration (>= MIN_CHUNKS_FOR_PRODUCT)
-                    # to be "confirmed" as a product, unless other chunks in
-                    # the same category already scored strongly.
-                    chunk.score          = float(MIN_SCORE)
-                    chunk.classified_by  = "llm_fallback"
-
-        unresolved = sum(1 for c in store.chunks if c.category == "UNKNOWN")
-        print(f"Unresolved after LLM: {unresolved}")
-        print(f"\n{store.summary()}")
-        return store
-
-    def _build_raw_chunks(
-        self, pages: List[PageText], chunk_size: int
-    ) -> List[Tuple[List[int], str]]:
-        """
-        Pack pages into text chunks of <= chunk_size chars.
-        Never splits a single page across two chunks.
-        Returns list of (page_numbers, text).
-        """
-        chunks:    List[Tuple[List[int], str]] = []
-        buf_texts: List[str] = []
-        buf_pages: List[int] = []
-        buf_len   = 0
-
-        def flush():
-            if buf_texts:
-                chunks.append((list(buf_pages), "\n\n".join(buf_texts)))
-                buf_texts.clear()
-                buf_pages.clear()
-
-        for page in pages:
-            tagged = f"[Page {page.page_number}]\n{page.text.strip()}"
-            if buf_len + len(tagged) > chunk_size and buf_texts:
-                flush()
-                buf_len = 0
-            buf_texts.append(tagged)
-            buf_pages.append(page.page_number)
-            buf_len += len(tagged)
-
-        flush()
-        return chunks
-
-    # ── LLM fallback classifier ────────────────────────────────────────────────
-
-    def _llm_classify_batch(
+    def extract_requirements_from_range(
         self,
-        llm_needed: List[Tuple[int, TextChunk]],
-    ) -> Dict[int, str]:
-        """
-        For chunks the taxonomy could not classify, call the (single, existing)
-        LLM once per chunk in parallel to assign a best-guess category from
-        the known taxonomy keys.
-        """
-        valid_cats = sorted(CATEGORY_TAXONOMY.keys())
-        valid_set  = set(valid_cats)
-        workers    = max(1, min(len(llm_needed), MAX_WORKERS))
-        results: Dict[int, str] = {}
-
-        def _classify_one(idx_chunk: Tuple[int, TextChunk]) -> Tuple[int, str]:
-            idx, chunk = idx_chunk
-            prompt = f"""You are classifying a chunk of text from a datacenter RFP / OEM datasheet.
-Pick the SINGLE best-matching category from this list:
-
-{chr(10).join(f"  - {c}" for c in valid_cats)}
-
-If nothing fits well, reply UNKNOWN.
-
-Reply with ONLY one category key from the list above (e.g. ADC). No sentence,
-no punctuation, no explanation.
-
-TEXT:
-{chunk.text[:1200]}
-"""
-            try:
-                resp = llm.generate(prompt, max_tokens=CLASSIFY_MAX_TOKENS)
-                resp = self._clean_llm_response(resp).strip().upper()
-
-                # Exact match first
-                if resp in valid_set:
-                    return (idx, resp)
-
-                # Otherwise: did a valid category name appear anywhere in
-                # the reply (model added punctuation/explanation)?
-                for cat in valid_cats:
-                    if re.search(rf"\b{re.escape(cat)}\b", resp):
-                        return (idx, cat)
-            except Exception as exc:
-                logger.warning(f"LLM classify failed for {chunk.chunk_id}: {exc}")
-            return (idx, "UNKNOWN")
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_classify_one, item): item for item in llm_needed}
-            for future in as_completed(futures):
-                idx, cat = future.result()
-                results[idx] = cat
-
-        return results
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # PHASE 2 – REQUIREMENT EXTRACTION  (category-scoped)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def extract_for_category(
-        self,
-        store: ChunkStore,
-        category: str,
+        pages: List[PageText],
+        start_page: int,
+        end_page: int,
     ) -> List[Requirement]:
         """
-        Extract all requirements for a given product category.
+        Extract every requirement found on pages [start_page, end_page]
+        (inclusive, 1-based). No product/category classification is performed
+        — every requirement on the selected pages is extracted.
 
-        1. Retrieve chunks labelled with `category` from the store.
-        2. Run regex pass (zero API calls).
-        3. Run parallel LLM extraction over the selected chunks.
+        1. Select the pages in range.
+        2. Run a regex pass for quick numeric thresholds (zero API calls).
+        3. Run parallel LLM extraction over the selected pages.
         4. Merge, deduplicate, assign IDs.
         """
-        matched = store.chunks_for(category)
-        if not matched:
-            logger.warning(f"No chunks found for category: {category}")
+        selected = self._select_pages(pages, start_page, end_page)
+        if not selected:
+            logger.warning(
+                f"No pages found in range {start_page}-{end_page} "
+                f"(document has {len(pages)} page(s))"
+            )
             return []
 
-        print(f"\n=== EXTRACTING: {category} ===")
-        print(f"    Chunks: {len(matched)}")
+        print(f"\n=== EXTRACTING REQUIREMENTS: pages {start_page}-{end_page} ===")
+        print(f"    Pages selected: {len(selected)}")
 
-        ext_chunks = self._repack_for_extraction(matched)
-        print(f"    Extraction chunks: {len(ext_chunks)}")
-
-        regex_reqs = self._regex_pass_chunks(matched, category)
+        regex_reqs = self._regex_pass_pages(selected)
         print(f"    Regex hits: {len(regex_reqs)}")
 
-        llm_reqs = self._llm_extract_parallel(ext_chunks, category)
+        ext_chunks = self._repack_pages_for_extraction(selected)
+        print(f"    Extraction chunks: {len(ext_chunks)}")
+
+        llm_reqs = self._llm_extract_parallel(ext_chunks)
         print(f"    LLM requirements (raw): {len(llm_reqs)}")
 
         all_reqs = self._deduplicate(regex_reqs + llm_reqs)
@@ -475,11 +213,18 @@ TEXT:
         print(f"    Final (after dedup): {len(all_reqs)}")
         return all_reqs
 
-    def _repack_for_extraction(
-        self, chunks: List[TextChunk]
+    @staticmethod
+    def _select_pages(
+        pages: List[PageText], start_page: int, end_page: int
+    ) -> List[PageText]:
+        lo, hi = min(start_page, end_page), max(start_page, end_page)
+        return [p for p in pages if lo <= p.page_number <= hi]
+
+    def _repack_pages_for_extraction(
+        self, pages: List[PageText]
     ) -> List[Tuple[str, int, int, str]]:
         """
-        Re-pack TextChunks into larger chunks (<= CHUNK_SIZE) for LLM extraction.
+        Re-pack pages into chunks (<= CHUNK_SIZE) for LLM extraction.
         Returns list of (label, first_page, last_page, text).
         """
         result:    List[Tuple[str, int, int, str]] = []
@@ -497,13 +242,14 @@ TEXT:
                 buf_texts.clear()
                 buf_pages.clear()
 
-        for chunk in chunks:
-            if buf_len + len(chunk.text) > CHUNK_SIZE and buf_texts:
+        for page in pages:
+            tagged = f"[Page {page.page_number}]\n{page.text.strip()}"
+            if buf_len + len(tagged) > CHUNK_SIZE and buf_texts:
                 flush()
                 buf_len = 0
-            buf_texts.append(chunk.text)
-            buf_pages.extend(chunk.pages)
-            buf_len += len(chunk.text)
+            buf_texts.append(tagged)
+            buf_pages.append(page.page_number)
+            buf_len += len(tagged)
 
         flush()
         return result
@@ -525,12 +271,10 @@ TEXT:
                 return metric, m.group("value"), m.group("unit")
         return None
 
-    def _regex_pass_chunks(
-        self, chunks: List[TextChunk], product: str
-    ) -> List[Requirement]:
+    def _regex_pass_pages(self, pages: List[PageText]) -> List[Requirement]:
         results: List[Requirement] = []
-        for chunk in chunks:
-            for sentence in self._split_sentences(chunk.text):
+        for page in pages:
+            for sentence in self._split_sentences(page.text):
                 hit = self._match_quant(sentence)
                 if not hit:
                     continue
@@ -541,20 +285,18 @@ TEXT:
                     # metric from the unit so the requirement is still
                     # usable rather than discarded.
                     metric = f"{unit} capacity"
-                first_page = chunk.pages[0] if chunk.pages else 0
                 results.append(Requirement(
                     requirement_id = "",
-                    category       = product,
+                    category       = "General",
                     requirement    = metric,
                     source_text    = sentence.strip(),
                     mandatory      = self._is_mandatory(sentence),
                     operator       = ">=",
                     value          = value,
                     unit           = unit,
-                    section        = f"Page {first_page}",
+                    section        = f"Page {page.page_number}",
                 ))
         return results
-
 
     # ──────────────────────────────────────────────────────────────────────────
     # LLM EXTRACTION  (parallel, with robust JSON handling + retry)
@@ -563,7 +305,6 @@ TEXT:
     def _llm_extract_parallel(
         self,
         chunks: List[Tuple[str, int, int, str]],
-        product: str,
     ) -> List[Requirement]:
         all_reqs: List[Requirement] = []
         if not chunks:
@@ -572,7 +313,7 @@ TEXT:
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(self._llm_extract_chunk, label, fp, lp, text, product): label
+                pool.submit(self._llm_extract_chunk, label, fp, lp, text): label
                 for label, fp, lp, text in chunks
             }
             for future in as_completed(futures):
@@ -586,10 +327,10 @@ TEXT:
 
         return all_reqs
 
-    def _build_extraction_prompt(self, text: str, product: str, first_page: int, last_page: int) -> str:
-        return f"""You are an RFP analyst extracting technical requirements for: {product}
+    def _build_extraction_prompt(self, text: str, first_page: int, last_page: int) -> str:
+        return f"""You are an RFP analyst extracting technical requirements from a Request for Proposal (RFP) document.
 
-The text below comes from pages {first_page}-{last_page} of an RFP / datasheet.
+The text below comes from pages {first_page}-{last_page} of the RFP.
 Each page is delimited by [Page N].
 
 Extract EVERY requirement stated in the text — both quantitative and qualitative.
@@ -598,6 +339,7 @@ Include: performance specs, capacity thresholds, feature support, compliance man
          interface requirements, security requirements, environmental requirements.
 
 Rules:
+- do not think return json immediately
 - Do NOT skip any requirement, even if it seems minor.
 - Each requirement must be a standalone, self-contained statement.
 - Do NOT invent requirements that are not in the text.
@@ -609,8 +351,9 @@ Rules:
 
 Each object must have exactly these keys:
   "requirement"  - concise, self-contained requirement statement (string)
-  "category"     - functional sub-area within {product} (e.g. "Performance", "HA",
-                   "Logging", "Authentication") - derive from the text
+  "category"     - functional area this requirement belongs to (e.g. "Performance", "High
+                   Availability", "Security", "Power", "Environmental", "Compliance",
+                   "Management", "Connectivity") - derive from the text
   "mandatory"    - true if text uses shall/must/mandatory/required, else false
   "source_text"  - the exact sentence from the document (preserve original wording)
   "page_number"  - page number where this requirement appears (integer)
@@ -628,9 +371,8 @@ TEXT:
         first_page:  int,
         last_page:   int,
         text:        str,
-        product:     str,
     ) -> List[Requirement]:
-        prompt = self._build_extraction_prompt(text, product, first_page, last_page)
+        prompt = self._build_extraction_prompt(text, first_page, last_page)
 
         items: List[dict] = []
         last_response = ""
@@ -666,7 +408,7 @@ TEXT:
 
             results.append(Requirement(
                 requirement_id = "",
-                category       = str(item.get("category", product)).strip() or product,
+                category       = str(item.get("category", "General")).strip() or "General",
                 requirement    = str(item["requirement"]).strip(),
                 source_text    = str(item.get("source_text", "")).strip(),
                 mandatory      = bool(item.get("mandatory", True)),
@@ -821,12 +563,11 @@ TEXT:
         2) Semantic dedup for regex-vs-LLM overlap: the regex pass and the
            LLM pass can both surface the SAME underlying spec (same numeric
            value/unit pulled from the same source sentence) but phrase the
-           `requirement` field differently — e.g. regex: "The firewall shall
-           support throughput", LLM: "Firewall throughput >= 40 Gbps". These
-           won't collide on exact text. We collapse entries that share the
-           same (value, unit, source_text) — preferring the LLM-derived
-           version since it's typically the more complete/self-contained
-           statement.
+           `requirement` field differently — e.g. regex: "Gbps capacity",
+           LLM: "Firewall throughput >= 40 Gbps". These won't collide on
+           exact text. We collapse entries that share the same (value, unit,
+           source_text) — preferring the LLM-derived version since it's
+           typically the more complete/self-contained statement.
         """
         # Pass 1: exact text dedup, preserving order
         seen:   set               = set()
@@ -854,7 +595,7 @@ TEXT:
 
         # We don't have an explicit "origin" field, so detect regex-origin
         # entries by the fact that `requirement` text is a verbatim prefix of
-        # `source_text` (how _regex_pass_chunks builds it) AND there exists
+        # `source_text` (how _regex_pass_pages builds it) AND there exists
         # another entry with the same semantic key that is NOT such a prefix
         # (i.e. came from the LLM).
         def is_regex_shaped(req: Requirement) -> bool:
@@ -889,10 +630,6 @@ TEXT:
             return 0
 
     # ──────────────────────────────────────────────────────────────────────────
-    # END-TO-END CONVENIENCE: write everything to one JSON file
-    # ──────────────────────────────────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────────────────────────────────
     # VECTOR STORE: embed requirements into the existing Chroma DB
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -908,7 +645,7 @@ TEXT:
         "does our proposal satisfy requirement X?").
 
         Each requirement becomes one Chroma document:
-          - id:        f"{source_file}::{category}::{requirement_id}"
+          - id:        f"{source_file}::{requirement_id}"
           - document:  the requirement text (embedded)
           - metadata:  category, requirement_id, mandatory, operator,
                        value, unit, section, source_file, source_text
@@ -932,11 +669,7 @@ TEXT:
             )
             return 0
 
-        all_reqs = []
-        for product in result.get("products", []):
-            for req in product.get("requirements", []):
-                all_reqs.append((product["category"], req))
-
+        all_reqs = result.get("requirements", [])
         if not all_reqs:
             print("\nNo requirements to embed.")
             return 0
@@ -958,29 +691,29 @@ TEXT:
 
         source_file = result.get("source_file", "unknown")
 
-        ids:        List[str] = []
-        documents:  List[str] = []
-        metadatas:  List[dict] = []
+        ids:       List[str] = []
+        documents: List[str] = []
+        metadatas: List[dict] = []
 
-        for category, req in all_reqs:
+        for req in all_reqs:
             req_id = req.get("requirement_id", "")
-            doc_id = f"{source_file}::{category}::{req_id}"
+            doc_id = f"{source_file}::{req_id}"
             ids.append(doc_id)
             documents.append(req.get("requirement", ""))
             metadatas.append({
-                "source_file":   str(source_file),
-                "category":      str(category),
+                "source_file":    str(source_file),
+                "category":       str(req.get("category", "")),
                 "requirement_id": str(req_id),
-                "mandatory":     bool(req.get("mandatory", False)),
-                "operator":      str(req.get("operator", "")),
-                "value":         str(req.get("value", "")),
-                "unit":          str(req.get("unit") or ""),
-                "section":       str(req.get("section", "")),
-                "source_text":   str(req.get("source_text", ""))[:1000],
+                "mandatory":      bool(req.get("mandatory", False)),
+                "operator":       str(req.get("operator", "")),
+                "value":          str(req.get("value", "")),
+                "unit":           str(req.get("unit") or ""),
+                "section":        str(req.get("section", "")),
+                "source_text":    str(req.get("source_text", ""))[:1000],
             })
 
         # Chroma upsert is idempotent on `ids`, so re-running the pipeline
-        # on the same PDF updates rather than duplicates entries.
+        # on the same PDF/page-range updates rather than duplicates entries.
         BATCH = 100
         for i in range(0, len(ids), BATCH):
             collection.upsert(
@@ -1000,42 +733,30 @@ TEXT:
     def run(
         self,
         pdf_path: str,
+        start_page: int,
+        end_page: int,
         output_json_path: str = OUTPUT_JSON_PATH,
         chroma_path: str = CHROMA_DB_PATH,
         chroma_collection: str = CHROMA_COLLECTION,
         embed: bool = True,
     ) -> dict:
         """
-        Full pipeline: extract pages -> classify -> for every CONFIRMED
-        product category, extract requirements -> write one JSON file
-        (default: data/requirements.json) -> embed every requirement into
-        the Chroma vector store for compliance-matching lookups.
+        Full pipeline: extract pages -> extract every requirement on the
+        chosen page range -> write one JSON file (default:
+        data/requirements.json) -> embed every requirement into the Chroma
+        vector store for compliance-matching lookups.
 
         Returns the same dict that gets written to disk.
         """
         pages = self.extract_pages(pdf_path)
-        store = self.chunk_and_classify(pages)
-
-        categories = store.confirmed_categories()
-        print(f"\n=== CONFIRMED PRODUCTS: {len(categories)} ===")
-        for cat in categories:
-            start, end = store.page_range_for(cat)
-            print(f"  - {cat}  (pages {start}-{end})")
+        reqs = self.extract_requirements_from_range(pages, start_page, end_page)
 
         result: dict = {
             "source_file": pdf_path,
-            "products": [],
+            "page_range": {"start": start_page, "end": end_page},
+            "requirement_count": len(reqs),
+            "requirements": [r.dict() for r in reqs],
         }
-
-        for cat in categories:
-            start, end = store.page_range_for(cat)
-            reqs = self.extract_for_category(store, cat)
-            result["products"].append({
-                "category":          cat,
-                "page_range":        {"start": start, "end": end},
-                "requirement_count": len(reqs),
-                "requirements":      [r.dict() for r in reqs],
-            })
 
         out_dir = os.path.dirname(output_json_path)
         if out_dir:

@@ -30,7 +30,6 @@ from ingestion.pdf_extractor import (
     detect_vendor_from_header,   # kept for direct use in tests / scripts
     extract_document,
 )
-from ingestion.classifier import propagate_category_from_models
 from knowledge_base.vector_store import VectorStoreManager
 from models.schemas import (
     DatasheetDocument,
@@ -197,20 +196,6 @@ class OEMIngestionPipeline:
 
             if not models:
                 result.warnings.append("No product models identified")
-
-            # Propagate category from models if doc-level detection was weak
-            if models:
-                first_cat = models[0].product_category
-                first_conf = models[0].category_confidence
-                model_cats = [(m.product_category, m.category_confidence) for m in models]
-                resolved_cat, resolved_conf = propagate_category_from_models(
-                    first_cat, first_conf, model_cats
-                )
-                if resolved_cat != first_cat:
-                    for m in models:
-                        m.product_category = resolved_cat
-                        m.category_confidence = resolved_conf
-                    logger.info(f"  → Category: {resolved_cat} (conf={resolved_conf:.2f})")
 
             # Attach spec tables
             all_tables_raw = [t for p in pages for t in p.get("tables", [])]

@@ -186,7 +186,6 @@ class VectorStoreManager:
         vendor: Optional[str] = None,
         model_name: Optional[str] = None,
         chunk_type: Optional[ChunkType] = None,
-        product_category: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Semantic search over all stored chunks.
@@ -202,8 +201,6 @@ class VectorStoreManager:
             where["model_name"] = {"$eq": model_name}
         if chunk_type:
             where["chunk_type"] = {"$eq": chunk_type.value}
-        if product_category:
-            where["product_category"] = {"$eq": product_category}
 
         query_embedding = self.embed_texts([query])[0]
 
@@ -237,7 +234,6 @@ class VectorStoreManager:
                 "model_name": meta.get("model_name", ""),
                 "chunk_type": meta.get("chunk_type", ""),
                 "product_family": meta.get("product_family", ""),
-                "product_category": meta.get("product_category", ""),
                 "source_file": meta.get("source_file", ""),
                 "metadata": meta,
             })

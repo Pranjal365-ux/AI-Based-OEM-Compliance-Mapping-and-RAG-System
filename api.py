@@ -48,10 +48,6 @@ class SearchResult:
         return self._raw.get("product_family", "")
 
     @property
-    def product_category(self) -> str:
-        return self._raw.get("product_category", "")
-
-    @property
     def chunk_type(self) -> str:
         return self._raw.get("chunk_type", "")
 

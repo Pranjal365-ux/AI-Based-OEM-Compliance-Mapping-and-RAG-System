@@ -13,7 +13,6 @@ load_dotenv()
 # ── Base paths ────────────────────────────────────────────────────────────────
 BASE_DIR          = Path(__file__).parent.parent
 DATA_DIR          = BASE_DIR / "data"
-requirements_json = BASE_DIR / "requirements"
 RAW_DIR           = DATA_DIR / "raw"
 PROCESSED_DIR     = DATA_DIR / "processed"
 VECTOR_STORE_DIR  = DATA_DIR / "vector_store"
@@ -26,8 +25,8 @@ for _d in (RAW_DIR, PROCESSED_DIR, VECTOR_STORE_DIR, LOGS_DIR):
 @dataclass
 class LLMConfig:
     provider: str = "local"
-    model: str = "qwen3:8b"
-    base_url: str = "http://192.168.2.123:11434/v1"
+    model: str = "llama3.1:8b"
+    base_url: str = "http://100.98.219.69:11434/v1"
     api_key: str = field(
         default_factory=lambda: os.getenv("LLM_API_KEY", "local")
     )
@@ -83,7 +82,7 @@ class ChunkingConfig:
 
 @dataclass
 class EmbeddingConfig:
-    base_url: str = "http://192.168.2.123:11434"
+    base_url: str = "http://100.98.219.69:11434"
     model_name: str = "bge-m3"
     batch_size: int = 32
     timeout_seconds: int = 300
@@ -138,11 +137,11 @@ class PipelineConfig:
     log_level: str = "INFO"
 
     use_llm_for_model_id: bool = True
-    llm_model: str = "qwen3:8b"
+    llm_model: str = "llama3.1:8b"
     llm_api_key: str = field(
         default_factory=lambda: os.getenv("LLM_API_KEY", "local")
     )
-    llm_base_url: str = "http://192.168.2.123:11434/v1"
+    llm_base_url: str = "http://100.98.219.69:11434/v1"
 
 
 DEFAULT_CONFIG = PipelineConfig()

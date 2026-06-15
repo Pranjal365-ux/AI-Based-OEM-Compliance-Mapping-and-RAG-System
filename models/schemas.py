@@ -126,8 +126,6 @@ class ModelSpec(BaseModel):
     model_name: str                 # Human-readable model name / part number
     vendor: str
     product_family: Optional[str] = None   # e.g. "FortiGate 200F Series"
-    product_category: str = "Unkown" # e.g. "Next-Generation Firewall"
-    category_confidence: float = 0.0
     description: str = ""
 
     # Raw spec data (before chunking)
@@ -155,8 +153,6 @@ class DatasheetDocument(BaseModel):
     filename: str
     vendor: VendorInfo
     page_count: int
-    product_category: str = "Unknown"
-    category_confidence: float = 0.0
     models: List[ModelSpec] = []         # One or more product models
     global_description: str = ""        # Text that applies to the whole doc
     extraction_method: ExtractionMethod = ExtractionMethod.PDFPLUMBER
@@ -189,7 +185,6 @@ class DocumentChunk(BaseModel):
     model_name: str
     model_id: str
     product_family: Optional[str] = None
-    product_category: Optional[str] = None
     chunk_type: ChunkType = ChunkType.GENERAL
     section_name: str = ""
     source_file: str = ""
@@ -208,7 +203,6 @@ class DocumentChunk(BaseModel):
             "model_name": self.model_name,
             "model_id": self.model_id,
             "product_family": self.product_family or "",
-            "product_category": self.product_category or "",
             "chunk_type": self.chunk_type.value,
             "section_name": self.section_name,
             "source_file": self.source_file,

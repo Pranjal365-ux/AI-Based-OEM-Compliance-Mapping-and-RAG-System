@@ -371,7 +371,6 @@ def _make_chunk(
         model_name=model.model_name,
         model_id=model.model_id,
         product_family=model.product_family,
-        product_category=model.product_category or doc.product_category,
         source_file=doc.source_path,
         source_pages=pages,
         page_start=pages[0] if pages else None,
@@ -402,7 +401,6 @@ def _chunks_for_model(
     model_header = (
         f"Vendor: {model.vendor} | Model: {model.model_name}"
         + (f" | Family: {model.product_family}" if model.product_family else "")
-        + (f" | Category: {model.product_category}" if model.product_category else "")
     )
 
     def make(text, chunk_type, section_name="", table_index=None, index=0):
