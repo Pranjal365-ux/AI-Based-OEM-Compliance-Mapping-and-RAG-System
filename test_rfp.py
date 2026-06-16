@@ -1,30 +1,54 @@
+"""
+Quick test / demo of the RFP extraction pipeline.
+
+Usage:
+  python test_rfp.py
+
+What it does:
+  1. Extracts all pages from the PDF
+  2. Extracts every requirement on pages START_PAGE–END_PAGE
+  3. Writes  data/requirements/<stem>_pp{start}-{end}.json
+  4. Embeds  into data/vector_store/ via bge-m3 (same Chroma as OEM KB)
+  5. Prints a summary to the terminal
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
 from rfp.rfp_extractor import RFPRequirementExtractor
+
+# ── Configure these two things ────────────────────────────────────────────────
+PDF_PATH   = "C:/Users/Pranjal/OneDrive/Desktop/Starlight/RFPs/datacenter_2023-12-29-16-00-03_56abbc0d86ad9ccc650d442bbabc286a.pdf"
+START_PAGE = 1
+END_PAGE   = 5
+# ─────────────────────────────────────────────────────────────────────────────
 
 extractor = RFPRequirementExtractor()
 
-PDF_PATH = "C:/Users/Pranjal/OneDrive/Desktop/Starlight/RFPs/datacenter_2023-12-29-16-00-03_56abbc0d86ad9ccc650d442bbabc286a.pdf"
-
-# Step 1: Load the PDF and report how many pages it has
+# Quick peek at document length before running
 pages = extractor.extract_pages(PDF_PATH)
-print(f"\nDocument has {len(pages)} page(s).")
+print(f"\nDocument: {len(pages)} page(s) total.")
+print(f"Scanning pages {START_PAGE}–{END_PAGE} …\n")
 
-# Step 2: User selects the page range to scan (e.g. the section of the RFP
-# that covers the product they're checking compliance for)
-start_page, end_page = 1, 5
+# Full pipeline: extract → save JSON → embed into Chroma
+result = extractor.run(PDF_PATH, START_PAGE, END_PAGE, embed=True)
 
-# Step 3: Extract every requirement found on those pages — no product /
-# category classification is performed
-requirements = extractor.extract_requirements_from_range(pages, start_page, end_page)
+# Summary
+print(f"\n{'─'*65}")
+print(f"Requirements found : {result['requirement_count']}")
+print(f"JSON saved to      : {result['json_path']}")
+print(f"Chroma collection  : {result['chroma_collection']}")
+print(f"{'─'*65}\n")
 
-print(f"\nExtracted {len(requirements)} requirement(s) from pages {start_page}-{end_page}:\n")
-for req in requirements:
-    flag = "MUST" if req.mandatory else "should"
-    value = f" {req.operator} {req.value} {req.unit or ''}".rstrip() if req.unit else ""
-    print(f"  [{req.requirement_id}] ({req.category}) {flag}: {req.requirement}{value}")
-    print(f"      source: {req.source_text!r}  ({req.section})")
-
-# Step 4 (optional): write everything to JSON and embed into Chroma for the
-# next stage (matching requirements against the OEM knowledge base and
-# generating a compliance report for the best-fitting products).
-#
-# result = extractor.run(PDF_PATH, start_page, end_page)
+# Print each requirement
+for req in result["requirements"]:
+    flag  = "MUST" if req["mandatory"] else "should"
+    value = ""
+    if req.get("unit"):
+        value = f"  [{req['operator']} {req['value']} {req['unit']}]"
+    elif req.get("value") and req["value"] != "true":
+        value = f"  [{req['operator']} {req['value']}]"
+    print(f"  [{req['requirement_id']}] ({req['category']}) {flag}: {req['requirement']}{value}")
+    print(f"      ↳ {req['source_text'][:120]!r}  ({req['section']})")
