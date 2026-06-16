@@ -1,0 +1,68 @@
+{
+  "run_id": "592c29a2",
+  "started_at": "2026-06-16T07:39:46.500697Z",
+  "completed_at": "2026-06-16T07:46:51.514030Z",
+  "total_files": 5,
+  "successful": 5,
+  "failed": 0,
+  "skipped": 0,
+  "total_models_extracted": 14,
+  "total_chunks_created": 551,
+  "file_results": [
+    {
+      "file_path": "data\\raw\\big-ip-advanced-waf-datasheet.pdf",
+      "doc_id": "6ebaf25b9fe08765",
+      "status": "completed",
+      "vendor": "Amazon Web Services",
+      "models_found": 1,
+      "chunks_created": 52,
+      "processing_time_seconds": 52.44,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\firewall-features-overview.pdf",
+      "doc_id": "52ddfdeaba7c9055",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 1,
+      "chunks_created": 26,
+      "processing_time_seconds": 19.44,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\fortigate-7000f-series.pdf",
+      "doc_id": "8ce8badd49c9fb3d",
+      "status": "completed",
+      "vendor": "Fortinet",
+      "models_found": 8,
+      "chunks_created": 362,
+      "processing_time_seconds": 271.43,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\opentext-siem-open-data-platform-ds-en.pdf",
+      "doc_id": "3ad5d89735767206",
+      "status": "completed",
+      "vendor": "OpenText",
+      "models_found": 1,
+      "chunks_created": 18,
+      "processing_time_seconds": 18.06,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\pa-3200-series.pdf",
+      "doc_id": "bf0c66afec5eba38",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 3,
+      "chunks_created": 93,
+      "processing_time_seconds": 63.51,
+      "warnings": [],
+      "error_message": ""
+    }
+  ]
+}

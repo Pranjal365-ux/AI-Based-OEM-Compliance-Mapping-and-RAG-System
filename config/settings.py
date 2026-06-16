@@ -30,7 +30,7 @@ class LLMConfig:
     # ── Reasoning model — used for compliance report generation where
     #    chain-of-thought genuinely helps answer quality.
     model: str = "qwen3:8b"
-    base_url: str = "http://192.168.2.123:11434/v1"
+    base_url: str = "http://100.98.219.69:11434/v1"
     api_key: str = field(
         default_factory=lambda: os.getenv("LLM_API_KEY", "local")
     )
@@ -96,7 +96,7 @@ class ChunkingConfig:
 
 @dataclass
 class EmbeddingConfig:
-    base_url: str = "http://192.168.2.123:11434"
+    base_url: str = "http://100.98.219.69:11434"
     model_name: str = "bge-m3"
     batch_size: int = 32
     timeout_seconds: int = 300
@@ -181,7 +181,7 @@ class PipelineConfig:
     llm_api_key: str = field(
         default_factory=lambda: os.getenv("LLM_API_KEY", "local")
     )
-    llm_base_url: str = "http://192.168.2.123:11434/v1"
+    llm_base_url: str = "http://100.98.219.69:11434/v1"
 
 
 DEFAULT_CONFIG = PipelineConfig()

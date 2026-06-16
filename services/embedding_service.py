@@ -4,7 +4,7 @@ import requests
 class EmbeddingService:
     def __init__(
         self,
-        base_url: str = "http://192.168.2.123:11434",
+        base_url: str = "http://100.98.219.69:11434",
         model: str = "bge-m3",
         timeout: int = 300,
     ):
