@@ -23,6 +23,7 @@ CPU performance notes
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
@@ -134,6 +135,8 @@ def build_candidate_products(
     higher because they are more likely to be relevant.
     """
     appearance_count: Dict[Tuple[str, str, str], int] = defaultdict(int)
+    score_sum: Dict[Tuple[str, str, str], float] = defaultdict(float)
+    chunk_types: Dict[Tuple[str, str, str], set[str]] = defaultdict(set)
 
     for chunks in evidence_map.values():
         # Count each product once per requirement (not once per chunk)
@@ -145,10 +148,61 @@ def build_candidate_products(
             if key not in seen_this_req:
                 appearance_count[key] += 1
                 seen_this_req.add(key)
+            score_sum[key] += chunk.score
+            if chunk.chunk_type:
+                chunk_types[key].add(chunk.chunk_type)
 
-    # Sort descending by appearance count
-    ranked = sorted(appearance_count.items(), key=lambda x: -x[1])
+    min_coverage = 2 if len(evidence_map) < 30 else 3
+    eligible = {
+        key: count for key, count in appearance_count.items()
+        if count >= min_coverage and _is_rankable_product(key, chunk_types[key])
+    }
+    if not eligible:
+        eligible = {
+            key: count for key, count in appearance_count.items()
+            if _is_rankable_product(key, chunk_types[key])
+        }
+
+    ranked = sorted(
+        eligible.items(),
+        key=lambda x: (-x[1], -score_sum[x[0]], x[0][0], x[0][1]),
+    )
     return [product for product, _ in ranked]
+
+
+_MODEL_CODE_RE = re.compile(
+    r"\b[A-Z]{1,6}[-_]?\d{2,8}[A-Z0-9-]*\b|\b\d{3,6}[A-Z]{1,4}\b",
+    re.IGNORECASE,
+)
+_COMPONENT_PREFIX_RE = re.compile(r"^(FIM|FPM|SPM|FMC|FPC|FAP)-", re.IGNORECASE)
+_GENERIC_TITLE_RE = re.compile(
+    r"\b(datasheet|data sheet|overview|features overview|brochure|whitepaper)\b",
+    re.IGNORECASE,
+)
+_SPEC_CHUNK_TYPES = {
+    "spec_text", "spec_table", "performance", "connectivity", "power",
+    "environmental", "dimensions", "certifications",
+}
+
+
+def _is_rankable_product(
+    product: Tuple[str, str, str],
+    seen_chunk_types: set[str],
+) -> bool:
+    vendor, model_name, product_family = product
+    if not vendor or not model_name:
+        return False
+    if _COMPONENT_PREFIX_RE.search(model_name):
+        return False
+    if _MODEL_CODE_RE.search(model_name):
+        return True
+    if product_family and _SPEC_CHUNK_TYPES.intersection(seen_chunk_types):
+        return True
+    if _GENERIC_TITLE_RE.search(model_name) and not _SPEC_CHUNK_TYPES.intersection(seen_chunk_types):
+        return False
+    if _GENERIC_TITLE_RE.search(model_name) and len(model_name.split()) > 4:
+        return False
+    return bool(_SPEC_CHUNK_TYPES.intersection(seen_chunk_types))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

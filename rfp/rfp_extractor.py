@@ -309,10 +309,13 @@ class RFPRequirementExtractor:
                 metric, value, unit = hit
                 if not metric:
                     metric = f"{unit} capacity"
+                requirement_text = self._quant_requirement_text(sentence, metric, value, unit)
+                if not self._is_valid_requirement_text(requirement_text):
+                    continue
                 results.append(Requirement(
                     requirement_id="",
                     category="General",
-                    requirement=metric,
+                    requirement=requirement_text,
                     source_text=sentence.strip(),
                     mandatory=self._is_mandatory(sentence),
                     operator=">=",
@@ -321,6 +324,24 @@ class RFPRequirementExtractor:
                     section=f"Page {page.page_number}",
                 ))
         return results
+
+    @staticmethod
+    def _quant_requirement_text(sentence: str, metric: str, value: str, unit: str) -> str:
+        clean_sentence = re.sub(r"\s+", " ", sentence).strip(" \t\r\n•*-")
+        clean_metric = re.sub(r"\s+", " ", metric).strip(" \t\r\n•*-:;,.")
+        generic_metrics = {
+            "the proposed solution should have",
+            "the proposed solution must have",
+            "the proposed solution shall have",
+            "solution should have",
+            "solution must have",
+            "solution shall have",
+        }
+        if clean_metric.lower() in generic_metrics or len(clean_metric.split()) < 2:
+            return clean_sentence
+        if re.search(r"\b(must|shall|should|required|minimum|at least)\b", clean_metric, re.IGNORECASE):
+            return clean_sentence
+        return f"{clean_metric} must be at least {value} {unit}."
 
     # ──────────────────────────────────────────────────────────────────────────
     # LLM EXTRACTION  (parallel, fast model, robust JSON parsing)
@@ -428,6 +449,8 @@ TEXT:
         results: List[Requirement] = []
         for item in items:
             if not isinstance(item, dict) or not item.get("requirement"):
+                continue
+            if not self._is_valid_requirement_text(str(item.get("requirement", ""))):
                 continue
             pg      = self._safe_int(item.get("page_number"))
             section = f"Page {pg}" if pg else chunk_label
@@ -551,6 +574,23 @@ TEXT:
         if any(w in lower for w in ("shall", "must", "mandatory", "required")):
             return True
         if any(w in lower for w in ("should", "preferred", "optional")):
+            return False
+        return True
+
+    @staticmethod
+    def _is_valid_requirement_text(text: str) -> bool:
+        clean = re.sub(r"\s+", " ", text or "").strip(" \t\r\n•*-:;,.")
+        if len(clean) < 12:
+            return False
+        vague = {
+            "the proposed solution should have",
+            "the proposed solution must have",
+            "the proposed solution shall have",
+            "the solution should have",
+            "the solution must have",
+            "the solution shall have",
+        }
+        if clean.lower() in vague:
             return False
         return True
 

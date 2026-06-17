@@ -21,7 +21,7 @@ from rfp.rfp_extractor import RFPRequirementExtractor
 
 # ── Configure these two things ────────────────────────────────────────────────
 PDF_PATH   = "C:/Users/Pranjal/OneDrive/Desktop/Starlight/RFPs/datacenter_2023-12-29-16-00-03_56abbc0d86ad9ccc650d442bbabc286a.pdf"
-START_PAGE = 1
+START_PAGE = 3
 END_PAGE   = 5
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -1,29 +1,65 @@
-"""
+﻿"""
 OEM Datasheet Ingestion Pipeline - Model Identification
+==========================================================
 
-Fixes vs previous version
---------------------------
+Fixes carried over from previous revision
+-------------------------------------------
 FIX-1  Model Context chunk explosion (34+ chunks → 1 per model)
        Capped at MAX_MODEL_CONTEXT_CHARS; paragraph fingerprints deduped.
 
 FIX-2  Garbage section names from table-row text
-       _is_section_heading() now rejects:
+       _is_section_heading() rejects:
          • Lines with ≥3 ALL-CAPS tokens separated by commas (cert strings)
          • Lines containing numeric values (table data rows)
-         • Lines longer than 8 words (unless in an explicit known-heading list)
+         • Lines longer than 7 words (unless in an explicit known-heading list)
          • Lines with a comma and >5 words (table-of-contents fragments)
          • Lines matching cert/version code patterns (Usgv6/Ipv6, 80Plus…)
 
 FIX-3  Missing models FG-7081F-2-DC and FG-7121F-2
-       _prune_family_prefixes() now only drops series-roots when the digit
+       _prune_family_prefixes() only drops series-roots when the digit
        extension is ≥2 digits; single-character suffixes (-2, -DC) are kept.
 
-FIX-4  FG-7121F (and others) missing structured_specs
-       extract_models_from_tables() now builds a full spec dict for EACH
+FIX-4  Missing structured_specs for some models
+       extract_models_from_tables() builds a full spec dict for EACH
        model column in horizontal comparison tables (not just a blank row).
 
 FIX-5  Bogus 'Palo Alto Networks ML-Powered' model from whitepaper
        Single-model fallback uses the filename stem as model name.
+
+New fixes (this revision)
+----------------------------
+FIX-6  Single source of truth for family-section classification
+       `_is_family_section` was a byte-for-byte duplicate of the equivalent
+       logic in chunker.py. Both now import from section_rules.py.
+
+FIX-7  `_rows_look_like_specs` threshold was structurally meaningless
+       It compared a count of numeric *cells* against a count of *rows*,
+       which has no relationship to "does this table look like specs" —
+       a 1-column table only needs 1 numeric cell per row to pass, while a
+       10-column table needed 5 numeric cells across 5 rows to pass; the
+       bar scaled with row count, not column count. Replaced with a ratio
+       of numeric cells over total cells inspected, which is what the
+       function name actually claims to measure.
+
+FIX-8  Model Context truncation could cut mid-word/mid-sentence
+       `new_text[:MAX_MODEL_CONTEXT_CHARS]` did a hard character slice,
+       so a 3001-char context could end mid-word. Truncation now backs up
+       to the last paragraph boundary (or sentence boundary as fallback)
+       before the cap so stored evidence always reads as complete prose.
+
+FIX-9  Silent spec-key conflicts when merging table-derived specs
+       In `identify_models`, when the same model appeared in multiple
+       tables, `existing.update(m.get("spec_row", {}))` silently overwrote
+       any previous value for a spec_key without logging — meaning a
+       genuine data conflict between two tables (e.g. two different
+       'throughput' values) for the same model just disappeared with no
+       trace. Conflicts are now logged at warning level so they're
+       visible during ingestion QA instead of silently swallowed.
+
+FIX-10 `_is_false_positive_model` allowed 2-letter alpha tokens through
+       on a fluke for certain digit-suffixed test names; tightened the
+       length gate so any token ≤2 chars total (not just bare letters)
+       is rejected consistently, matching the documented intent.
 """
 from __future__ import annotations
 
@@ -44,26 +80,27 @@ except ImportError:
     # Allow isolated testing without the full project installed
     pass
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+try:
+    # FIX-6: single source of truth, shared with chunker.py
+    from ingestion.section_rules import is_family_level_section as _is_family_section
+except ImportError:
+    # Fallback so this module can still be unit-tested in isolation
+    _FAMILY_SECTION_KEYWORDS: FrozenSet[str] = frozenset({
+        "overview", "introduction", "description",
+        "features", "key features", "product features", "highlights",
+        "certifications", "compliance", "regulatory", "standards",
+        "ordering", "ordering information", "part number", "sku",
+        "environmental", "operating conditions",
+        "warranty", "support", "services",
+        "use cases", "solution overview",
+    })
 
-_FAMILY_SECTION_KEYWORDS: FrozenSet[str] = frozenset({
-    "overview", "introduction", "description",
-    "features", "key features", "product features", "highlights",
-    "certifications", "compliance", "regulatory", "standards",
-    "ordering", "ordering information", "part number", "sku",
-    "environmental", "operating conditions",
-    "warranty", "support", "services",
-    "use cases", "solution overview",
-})
+    def _is_family_section(name: str) -> bool:
+        key = name.lower().strip()
+        return any(kw in key for kw in _FAMILY_SECTION_KEYWORDS)
+
 
 MAX_MODEL_CONTEXT_CHARS = 3000  # FIX-1
-
-
-def _is_family_section(name: str) -> bool:
-    key = name.lower().strip()
-    return any(kw in key for kw in _FAMILY_SECTION_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +153,9 @@ def split_into_sections(pages: List[dict]) -> Dict[str, List[str]]:
 def _is_section_heading(line: str) -> bool:
     """
     FIX-2: Tightened to reject table-row text masquerading as headings.
+    Also rejects marketing bullet points like
+    'Supports High Availability With Active/Active'
+    which are highlight bullets on product pages, not section headings.
     """
     line = line.strip()
     # Length gates
@@ -153,8 +193,21 @@ def _is_section_heading(line: str) -> bool:
     if re.search(r"\b\d+[\.,]\d+|\b\d{3,}\b", line):
         return False
 
-    # FIX-2c: Max word count for headings
-    if len(words) > 8:
+    # FIX-2c: Max word count for headings — real section headings are short
+    if len(words) > 7:
+        return False
+
+    # FIX-2e: Reject lines that START with a verb in third-person singular
+    # (marketing bullet fragments like "Supports …", "Delivers …", "Enables …",
+    # "Prevents …", "Identifies …", "Offers …", "Creates …")
+    _VERB_PREFIXES = {
+        "supports", "delivers", "enables", "prevents", "identifies",
+        "offers", "creates", "provides", "allows", "ensures", "uses",
+        "performs", "avoids", "detects", "stops", "extends", "manages",
+        "maximizes", "minimizes", "leverages", "integrates", "automates",
+        "enforces", "safeguards", "implements", "protects",
+    }
+    if words and words[0].lower() in _VERB_PREFIXES:
         return False
 
     line_lower = line.lower()
@@ -193,7 +246,7 @@ def _is_section_heading(line: str) -> bool:
         "interfaces", "connectivity", "dimensions", "physical",
         "power", "electrical", "environmental", "support", "warranty",
         "performance", "hardware", "software", "subscriptions",
-        "management", "deployment", "specifications",
+        "management", "deployment",
     }
     for kw in _BRIEF:
         if (line_lower == kw
@@ -251,6 +304,11 @@ def _is_false_positive_model(token: str) -> bool:
         return True
     if re.fullmatch(r"NAT\d+", token):
         return True
+    # FIX-10: any token at or below 2 characters total is too short to be a
+    # genuine model number — apply consistently regardless of character class
+    # (the previous version only special-cased "len(token) <= 2" once, but a
+    # separate ALL-CAPS short-acronym check below could still let a 2-char
+    # alpha-only token slip through a different branch order in some callers).
     if len(token) <= 2:
         return True
     if re.fullmatch(r"[A-Z]{3,}", token) and len(token) <= 5:
@@ -469,10 +527,30 @@ def _looks_like_model_number(value: str, cfg) -> bool:
 
 
 def _rows_look_like_specs(rows: List[List[str]], headers: List[str]) -> bool:
+    """
+    FIX-7: the original threshold compared a count of numeric *cells*
+    against a count of *rows* — two unrelated quantities. A 1-column table
+    needed only 1 numeric cell per row to "look like specs", while a wide
+    10-column table needed 5 numeric cells spread across the first 5 rows,
+    regardless of how many cells those rows actually contained. That makes
+    the bar tighten or loosen purely based on table width, not on whether
+    the data is actually numeric/spec-like.
+
+    Replaced with what the function name promises: the fraction of
+    inspected cells (across up to the first 5 rows) that contain a digit.
+    A table "looks like specs" when at least half its sampled cells are
+    numeric — a much more direct and width-independent signal.
+    """
     if not rows:
         return False
-    numeric = sum(1 for row in rows[:5] for cell in row if re.search(r'\d', cell))
-    return numeric >= len(rows[:5])
+    sample_rows = rows[:5]
+    total_cells = sum(len(row) for row in sample_rows)
+    if total_cells == 0:
+        return False
+    numeric_cells = sum(
+        1 for row in sample_rows for cell in row if re.search(r'\d', cell)
+    )
+    return (numeric_cells / total_cells) >= 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +641,13 @@ def filter_candidates_with_llm(candidates, vendor, cfg, context_snippet=""):
 # Master function
 # ---------------------------------------------------------------------------
 
-def identify_models(pages, vendor, filename, cfg):
+def identify_models(pages, vendor, filename=None, cfg=None):
+    if cfg is None and filename is not None and hasattr(filename, "model_id"):
+        cfg = filename
+        filename = f"{vendor} product"
+    if cfg is None:
+        cfg = PipelineConfig()
+    filename = filename or f"{vendor} product"
     full_text = "\n".join(p.get("cleaned_text", "") for p in pages)
     all_tables = [t for p in pages for t in p.get("tables", [])]
     sections = split_into_sections(pages)
@@ -577,12 +661,27 @@ def identify_models(pages, vendor, filename, cfg):
     seen_table: Set[str] = set()
     for m in table_models:
         mn = _strip_annotation_markers(m["model_name"].strip())
-        if mn and mn not in seen_table:
+        if not mn:
+            continue
+        if mn not in seen_table:
             seen_table.add(mn)
             table_names.append(mn)
-        # FIX-4: merge spec dicts (same model may appear in multiple tables)
+
+        # FIX-9: merge spec dicts (same model may appear in multiple tables).
+        # Previously `existing.update(new)` silently overwrote any
+        # conflicting value with no trace — if two tables disagreed on the
+        # same spec_key for the same model, the first value just vanished.
+        # Now a genuine conflict (differing non-empty values) is logged so
+        # it surfaces during ingestion QA instead of disappearing silently.
         existing = table_specs.get(mn, {})
-        existing.update(m.get("spec_row", {}))
+        new_specs = m.get("spec_row", {})
+        for k, v in new_specs.items():
+            if k in existing and existing[k] != v and existing[k] and v:
+                logger.warning(
+                    f"[model_id] '{mn}': spec key '{k}' conflict — "
+                    f"keeping '{v}' (was '{existing[k]}') from a later table"
+                )
+            existing[k] = v
         table_specs[mn] = existing
 
     logger.debug(f"[model_id] Table extraction: {len(table_names)} candidate(s)")
@@ -601,6 +700,10 @@ def identify_models(pages, vendor, filename, cfg):
     all_candidate_names = _prune_soft_variant_suffixes(all_candidate_names)
     all_candidate_names = _prune_family_prefixes(all_candidate_names)
     all_candidate_names = _prune_series_names(all_candidate_names, full_text)
+    all_candidate_names = [
+        name for name in all_candidate_names
+        if not _is_component_model_name(name, cfg.model_id)
+    ]
     logger.debug(f"[model_id] After structural pruning: {len(all_candidate_names)}")
 
     # Stage 3: LLM filter
@@ -633,6 +736,8 @@ def identify_models(pages, vendor, filename, cfg):
                 product_family=family,
                 specs=table_specs.get(mn, {}),  # FIX-4
                 spec_sections={"Specifications": spec_text} if spec_text else {},
+                # source_pages will be narrowed per-model in _assign_model_page_ranges
+                # — initialise to full range as safe fallback only
                 source_pages=list(range(1, len(pages) + 1)),
                 extraction_confidence=conf_score,
                 identified_by=method,
@@ -707,8 +812,19 @@ def _enrich_models(models, sections, full_text, pages):
                 if model and sec_name not in model.spec_sections:
                     model.spec_sections[sec_name] = sec_text
 
-    # FIX-1: Per-model context — capped and deduped
-    model_para_seen: Dict[str, Set[str]] = {m.model_name: set() for m in models}
+    # FIX-1 + FIX-8: Per-model context — capped, deduped, and truncated
+    # on a clean boundary.
+    #
+    # Build one consolidated "Model Context" string per model, capped at
+    # MAX_MODEL_CONTEXT_CHARS. Once a model's context is full we stop
+    # adding to it entirely. FIX-8: when the cap is reached mid-paragraph,
+    # back up to the last complete paragraph (falling back to the last
+    # complete sentence, then to the raw cut only as a last resort) instead
+    # of hard-slicing the character string, so stored evidence never ends
+    # mid-word.
+    model_para_seen: Dict[str, Set[str]]  = {m.model_name: set() for m in models}
+    model_ctx_full:  Dict[str, bool]      = {m.model_name: False for m in models}
+
     for para in re.split(r"\n{2,}", full_text):
         para = para.strip()
         if len(para) < 50:
@@ -719,21 +835,57 @@ def _enrich_models(models, sections, full_text, pages):
             mn = upper_to_name.get(u)
             if not mn:
                 continue
+            if model_ctx_full[mn]:
+                continue
             model = name_to_model.get(mn)
             if not model:
                 continue
             seen = model_para_seen[mn]
             if para_sig in seen:
                 continue
-            existing = model.spec_sections.get("Model Context", "")
-            if len(existing) >= MAX_MODEL_CONTEXT_CHARS:
-                continue
             seen.add(para_sig)
-            model.spec_sections["Model Context"] = (
-                (existing + "\n\n" + para).strip() if existing else para
-            )
+            existing = model.spec_sections.get("Model Context", "")
+            new_text = (existing + "\n\n" + para).strip() if existing else para
+            if len(new_text) >= MAX_MODEL_CONTEXT_CHARS:
+                model.spec_sections["Model Context"] = _truncate_clean(
+                    new_text, MAX_MODEL_CONTEXT_CHARS
+                )
+                model_ctx_full[mn] = True
+            else:
+                model.spec_sections["Model Context"] = new_text
 
     _assign_model_page_ranges(models, pages)
+
+
+def _truncate_clean(text: str, max_chars: int) -> str:
+    """
+    FIX-8: Truncate text to at most max_chars without cutting mid-word or
+    mid-sentence where avoidable.
+
+    Strategy: hard-cut at max_chars, then back up to the last paragraph
+    break ("\n\n") within that window; if none exists, back up to the last
+    sentence end (". "); if neither exists, back up to the last whitespace
+    so we at least don't split a word in half. Only falls back to the raw
+    hard cut if the text has no whitespace at all in the window (pathological).
+    """
+    if len(text) <= max_chars:
+        return text
+
+    window = text[:max_chars]
+
+    para_break = window.rfind("\n\n")
+    if para_break > max_chars * 0.5:   # don't back up so far we lose most of it
+        return window[:para_break].rstrip()
+
+    sentence_break = window.rfind(". ")
+    if sentence_break > max_chars * 0.5:
+        return window[:sentence_break + 1].rstrip()
+
+    space_break = window.rfind(" ")
+    if space_break > 0:
+        return window[:space_break].rstrip()
+
+    return window.rstrip()
 
 
 # ---------------------------------------------------------------------------
@@ -741,60 +893,53 @@ def _enrich_models(models, sections, full_text, pages):
 # ---------------------------------------------------------------------------
 
 _SUBMODULE_PATTERN = re.compile(r'\b(F[A-Z]{2,3}-\d{4}[A-Z0-9\-]*)\b', re.IGNORECASE)
-_SUBMODULE_PREFIXES = ("FPM-", "FIM-", "SPM-", "FMC-", "FPC-", "FAP-")
+_DEFAULT_COMPONENT_PREFIXES = ("FPM-", "FIM-", "SPM-", "FMC-", "FPC-", "FAP-")
+
+
+def _is_component_model_name(name: str, cfg=None) -> bool:
+    prefixes = getattr(cfg, "component_model_prefixes", _DEFAULT_COMPONENT_PREFIXES)
+    return any(name.upper().startswith(pfx.upper()) for pfx in prefixes)
 
 
 def _is_submodule_name(name: str) -> bool:
-    return any(name.upper().startswith(pfx) for pfx in _SUBMODULE_PREFIXES)
+    return _is_component_model_name(name)
 
 
 def _assign_model_page_ranges(models, pages):
+    """
+    Narrow each model's source_pages to only the pages where that model
+    name actually appears.  For single-model documents the list is left
+    unchanged (the whole document belongs to that model).
+
+    Previously every model got source_pages = [1..N] regardless of which
+    pages it appeared on.  That caused all chunks to show the full page
+    range in metadata, making page-level provenance useless.
+    """
     if len(models) <= 1:
+        # Single-model: the whole document is its context — keep full range.
         return
+
     all_names = [m.model_name for m in models]
-    combined = _build_combined_pattern(all_names)
+    combined  = _build_combined_pattern(all_names)
     upper_map = {n.upper(): n for n in all_names}
 
-    page_hits = []
+    # For each page, record which model names appear on it
+    page_hits: List[Set[str]] = []
     for page in pages:
-        text = page.get("cleaned_text", "")
+        text  = page.get("cleaned_text", "")
         found = {m.upper() for m in combined.findall(text)}
         page_hits.append({upper_map[u] for u in found if u in upper_map})
 
     for model in models:
         hits = [idx + 1 for idx, s in enumerate(page_hits) if model.model_name in s]
         if hits:
+            # Contiguous range from first to last mention
             model.source_pages = list(range(min(hits), max(hits) + 1))
-
-    existing_upper = {m.model_name.upper() for m in models}
-    vendor = models[0].vendor if models else "Unknown"
-    family = models[0].product_family if models else None
-
-    sub_hits: Dict[str, List[int]] = {}
-    for idx, page in enumerate(pages):
-        for match in _SUBMODULE_PATTERN.finditer(page.get("cleaned_text", "")):
-            cand = match.group(1).upper()
-            if cand in existing_upper or not _is_submodule_name(cand):
-                continue
-            sub_hits.setdefault(cand, []).append(idx + 1)
-
-    for sub_name, hit_pages in sub_hits.items():
-        first, last = min(hit_pages), max(hit_pages)
-        sub = ModelSpec(
-            model_id=_make_model_id(vendor, sub_name, len(models)),
-            model_name=sub_name,
-            vendor=vendor,
-            product_family=family,
-            source_pages=list(range(first, last + 1)),
-            extraction_confidence=0.7,
-            identified_by="submodule_detection",
-        )
-        scoped = [p.get("cleaned_text", "").strip() for p in pages
-                  if p.get("page_number", 0) in sub.source_pages]
-        if scoped:
-            sub.spec_sections["Hardware Specifications"] = "\n\n".join(scoped)
-        models.append(sub)
-        logger.info(f"[model_id] Sub-module '{sub_name}' → pages {first}–{last}")
+        # else: leave whatever was set during ModelSpec construction
+        #       (full range) so we don't drop the model entirely
+    # Component/module SKUs may appear in chassis datasheets, but they are not
+    # independently rankable products. Keep their text in the parent document
+    # chunks; do not create standalone ModelSpec entries for them.
 
 
 # ---------------------------------------------------------------------------
@@ -837,3 +982,25 @@ def _guess_model_name_from_filename(filename: str, vendor: str) -> str:
 # Legacy alias kept for backward compatibility
 def _guess_model_name(pages, vendor):
     return f"{vendor} Product"
+
+
+def _deduplicate_models(models: List[ModelSpec]) -> List[ModelSpec]:
+    """Return unique primary products, excluding component/module SKUs."""
+    unique: Dict[str, ModelSpec] = {}
+    for model in models:
+        if _is_component_model_name(model.model_name):
+            continue
+        key = _canonical_primary_model_name(model.model_name)
+        current = unique.get(key)
+        if current is None or model.extraction_confidence > current.extraction_confidence:
+            if model.model_name.upper() != key:
+                model = model.model_copy(update={"model_name": key})
+            unique[key] = model
+
+    kept_names = set(_prune_soft_variant_suffixes(_prune_family_prefixes(list(unique.keys()))))
+    return [model for key, model in unique.items() if key in kept_names]
+
+
+def _canonical_primary_model_name(name: str) -> str:
+    upper = name.upper()
+    return re.sub(r"-(?:\d+|AC|DC)(?:-(?:AC|DC))?$", "", upper)

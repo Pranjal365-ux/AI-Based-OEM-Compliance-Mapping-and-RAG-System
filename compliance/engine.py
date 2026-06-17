@@ -100,8 +100,16 @@ class ComplianceEngine:
         """
         if not requirements:
             logger.warning("No requirements provided — nothing to evaluate.")
+            # Bug fixed: this used the literal string "empty" as report_id.
+            # Every call with no requirements produced the same ID, so if
+            # this object were ever logged, compared, or (mistakenly) looked
+            # up against REPORTS_DIR, two different empty-runs would be
+            # indistinguishable. A real run is never written for this case
+            # (there's nothing to report), but the ID itself must still be
+            # unique so it can't collide with anything else.
+            import uuid
             return ComplianceReport(
-                report_id="empty",
+                report_id=f"empty_{uuid.uuid4().hex[:12]}",
                 rfp_source=rfp_source,
             )
 
@@ -130,13 +138,20 @@ class ComplianceEngine:
 
         if not candidates:
             logger.warning("Knowledge base returned no matching products.")
-            return ComplianceReport(
-                report_id="no_candidates",
-                rfp_source=rfp_source,
-                page_range=page_range or {},
-                total_requirements=len(requirements),
-                mandatory_count=mandatory_count,
-                optional_count=len(requirements) - mandatory_count,
+            # Bug fixed: this used to construct a ComplianceReport directly
+            # and return it WITHOUT calling reporter.generate_report(), so
+            # no JSON/Markdown file was ever written to disk — the caller
+            # got a report_id but nothing persisted for it. It also reused
+            # the literal string "no_candidates" as the ID, so a second
+            # no-evidence run would silently overwrite the first report.
+            # Routing through generate_report() gives it a real unique ID
+            # and writes both output files like every other code path.
+            return reporter.generate_report(
+                requirements = requirements,
+                top_products = [],
+                rfp_source   = rfp_source,
+                page_range   = page_range,
+                kb_chunks    = total_chunks,
             )
 
         # ── Step 3: Rank products (Phases 4 + 5) ──────────────────────────────

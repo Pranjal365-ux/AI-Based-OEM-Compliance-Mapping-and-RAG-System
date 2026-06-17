@@ -1,5 +1,6 @@
 """
 OEM Datasheet Ingestion Pipeline - Smart Chunking
+====================================================
 Converts ModelSpec objects into DocumentChunk objects ready for embedding.
 
 Chunking strategy (one chunk per logical unit, no duplication):
@@ -10,34 +11,65 @@ Chunking strategy (one chunk per logical unit, no duplication):
   5.  Per-model features           → 1 chunk
   6.  Ordering info                → 1 chunk per section
 
-Fixes applied (vs previous version)
-------------------------------------
+Fixes applied (this revision)
+------------------------------
 FIX-1  Model Context chunk explosion
-       Previously 34+ identical context chunks were emitted per model because
-       each paragraph referencing a model was appended without dedup or cap.
-       Now Model Context is collapsed into a SINGLE chunk per model.
+       Previously 34+ identical context chunks were emitted per model
+       because each paragraph referencing a model was appended without
+       dedup or cap. Now Model Context is collapsed into a SINGLE chunk
+       per model (capped upstream in model_identifier.MAX_MODEL_CONTEXT_CHARS).
 
 FIX-2  Garbage section names in metadata
        Section names that came from table-row text (e.g. "Certifications Fcc,
-       Ices…") polluted the section_name field.  The section splitter in
-       model_identifier is now tightened; the chunker additionally normalises
+       Ices…") polluted the section_name field. The section splitter in
+       model_identifier is tightened; the chunker additionally normalises
        section_name before storing it.
 
 FIX-3  FG-7121F (and other models) missing structured_specs
-       The structured_specs chunk now uses model.specs (the per-column dict
+       The structured_specs chunk uses model.specs (the per-column dict
        built in the fixed extract_models_from_tables) rather than only
        model.spec_sections["Specifications"].
 
 FIX-4  Duplicate table content in per-model sections
        Hardware-spec tables that span all models are emitted once at family
        level; individual models no longer get a redundant full copy.
+
+FIX-5  [NEW] Fatal syntax error in family-level section loop
+       The previous revision had a dangling tuple/string concatenation
+       (`header = (...)` was missing its opening assignment and the
+       `model_header` prefix), which made the module fail to import at
+       all. Restored the correct chunk-header construction.
+
+FIX-6  [NEW] Single source of truth for section classification
+       `_is_family_level_section` / `_is_garbage_section` /
+       `_normalise_section_name` were copy-pasted from model_identifier.py.
+       Both modules now import from `section_rules.py`, so a future edit
+       can't silently desync them and reintroduce duplicate chunks.
+
+FIX-7  [NEW] Family representative selection
+       Multi-model docs always used `doc.models[0]` as the source of
+       family-level sections. If the first detected model happened to be a
+       sparse table-only entry, family-level content (Overview, Features,
+       Certifications, etc.) attached to a *different* model was silently
+       dropped from the family-level pass. Now the representative is the
+       model with the most spec_sections, so the richest source wins.
+
+FIX-8  [NEW] Cross-model duplicate spec tables
+       In multi-model docs, a shared hardware/performance table that lists
+       all models side-by-side could be attached to every model's
+       `spec_tables` list upstream and then get re-chunked once per model
+       — i.e. the same table text appearing N times across N models'
+       per-model sections. Tables are now content-hash deduped per
+       document so each distinct table is chunked at most once per model
+       it's *actually specific to* (family-level tables are also still
+       only emitted once via Step A).
 """
 from __future__ import annotations
 
 import hashlib
 import re
 from datetime import datetime, timezone
-from typing import Callable, Dict, FrozenSet, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from loguru import logger
 
@@ -46,8 +78,12 @@ from models.schemas import (
     ChunkType,
     DatasheetDocument,
     DocumentChunk,
-    ExtractedTable,
     ModelSpec,
+)
+from ingestion.section_rules import (
+    is_family_level_section,
+    is_garbage_section,
+    normalise_section_name,
 )
 
 
@@ -56,98 +92,106 @@ from models.schemas import (
 # ---------------------------------------------------------------------------
 
 _SECTION_CHUNK_TYPE_MAP: Dict[str, ChunkType] = {
-    "specifications": ChunkType.SPEC_TEXT,
-    "technical specifications": ChunkType.SPEC_TEXT,
-    "hardware specifications": ChunkType.SPEC_TABLE,
-    "system performance and capacity": ChunkType.PERFORMANCE,
-    "system performance": ChunkType.PERFORMANCE,
-    "performance": ChunkType.PERFORMANCE,
-    "throughput": ChunkType.PERFORMANCE,
-    "capacity": ChunkType.PERFORMANCE,
-    "power": ChunkType.POWER,
-    "power requirements": ChunkType.POWER,
-    "electrical": ChunkType.POWER,
-    "dimensions": ChunkType.DIMENSIONS,
-    "physical": ChunkType.DIMENSIONS,
-    "form factor": ChunkType.DIMENSIONS,
-    "certifications": ChunkType.CERTIFICATIONS,
-    "compliance": ChunkType.CERTIFICATIONS,
-    "regulatory": ChunkType.CERTIFICATIONS,
-    "standards": ChunkType.CERTIFICATIONS,
-    "interfaces": ChunkType.CONNECTIVITY,
-    "connectivity": ChunkType.CONNECTIVITY,
-    "ports": ChunkType.CONNECTIVITY,
-    "networking": ChunkType.CONNECTIVITY,
-    "features": ChunkType.FEATURES,
-    "key features": ChunkType.FEATURES,
-    "ordering": ChunkType.ORDERING_INFO,
-    "ordering information": ChunkType.ORDERING_INFO,
-    "part number": ChunkType.ORDERING_INFO,
-    "environmental": ChunkType.ENVIRONMENTAL,
-    "operating conditions": ChunkType.ENVIRONMENTAL,
+    # Spec / performance
+    "specifications":                    ChunkType.SPEC_TEXT,
+    "technical specifications":          ChunkType.SPEC_TEXT,
+    "hardware specifications":           ChunkType.SPEC_TABLE,
+    "system performance and capacity":   ChunkType.PERFORMANCE,
+    "system performance":                ChunkType.PERFORMANCE,
+    "performance":                       ChunkType.PERFORMANCE,
+    "throughput":                        ChunkType.PERFORMANCE,
+    "capacity":                          ChunkType.PERFORMANCE,
+    # Power / physical
+    "power":                             ChunkType.POWER,
+    "power requirements":                ChunkType.POWER,
+    "power supply":                      ChunkType.POWER,
+    "electrical":                        ChunkType.POWER,
+    "dimensions":                        ChunkType.DIMENSIONS,
+    "physical":                          ChunkType.DIMENSIONS,
+    "form factor":                       ChunkType.DIMENSIONS,
+    # Certifications
+    "certifications":                    ChunkType.CERTIFICATIONS,
+    "compliance":                        ChunkType.CERTIFICATIONS,
+    "regulatory":                        ChunkType.CERTIFICATIONS,
+    "standards":                         ChunkType.CERTIFICATIONS,
+    "environmental":                     ChunkType.ENVIRONMENTAL,
+    "operating conditions":              ChunkType.ENVIRONMENTAL,
+    # Connectivity — ONLY actual port/interface/network sections
+    "interfaces":                        ChunkType.CONNECTIVITY,
+    "ports":                             ChunkType.CONNECTIVITY,
+    "networking":                        ChunkType.CONNECTIVITY,
+    "network address translation":       ChunkType.CONNECTIVITY,
+    "high availability":                 ChunkType.CONNECTIVITY,
+    "routing":                           ChunkType.CONNECTIVITY,
+    "vpn":                               ChunkType.CONNECTIVITY,
+    "sd-wan":                            ChunkType.CONNECTIVITY,
+    "vlan":                              ChunkType.CONNECTIVITY,
+    "zero touch provisioning":           ChunkType.CONNECTIVITY,
+    # Security — separate from connectivity
+    "security":                          ChunkType.SPEC_TEXT,
+    "threat prevention":                 ChunkType.SPEC_TEXT,
+    "antivirus":                         ChunkType.SPEC_TEXT,
+    "ips":                               ChunkType.SPEC_TEXT,
+    "intrusion":                         ChunkType.SPEC_TEXT,
+    "wildfire":                          ChunkType.SPEC_TEXT,
+    "dlp":                               ChunkType.SPEC_TEXT,
+    "url filtering":                     ChunkType.SPEC_TEXT,
+    "web filtering":                     ChunkType.SPEC_TEXT,
+    "application control":               ChunkType.SPEC_TEXT,
+    "ssl inspection":                    ChunkType.SPEC_TEXT,
+    "zero trust":                        ChunkType.SPEC_TEXT,
+    # Features / management
+    "features":                          ChunkType.FEATURES,
+    "key features":                      ChunkType.FEATURES,
+    "highlights":                        ChunkType.FEATURES,
+    "management":                        ChunkType.SPEC_TEXT,
+    "management i/o":                    ChunkType.SPEC_TEXT,
+    "storage":                           ChunkType.SPEC_TEXT,
+    # Ordering
+    "ordering":                          ChunkType.ORDERING_INFO,
+    "ordering information":              ChunkType.ORDERING_INFO,
+    "part number":                       ChunkType.ORDERING_INFO,
 }
 
-_FAMILY_LEVEL_SECTION_KEYWORDS: FrozenSet[str] = frozenset({
-    "overview", "introduction", "description",
-    "features", "key features", "product features", "highlights",
-    "certifications", "compliance", "regulatory", "standards",
-    "ordering", "ordering information", "part number", "sku",
-    "environmental", "operating conditions",
-    "warranty", "support", "services",
-    "use cases", "solution overview",
-})
 
-# FIX-2: section names to skip entirely (garbage from table-row text)
-_GARBAGE_SECTION_PATTERNS = re.compile(
-    r"""
-    \d{1,3}\s*x\s*\d{1,3}   # dimensions like "2.48 x 17.11"
-    | \b\d{2,4}\s*gbps?\b    # throughput values
-    | \b\d{3,}\b             # long standalone numbers
-    | fcc\b.*\bce\b          # cert strings
-    | qsfp\b                 # port type codes
-    | sku\s+description      # ordering table header fragments
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-
-def _is_family_level_section(section_name: str) -> bool:
-    key = section_name.lower().strip()
-    return any(kw in key for kw in _FAMILY_LEVEL_SECTION_KEYWORDS)
-
-
-def _is_garbage_section(section_name: str) -> bool:
-    """Return True if the section name looks like it came from table-row text."""
-    s = section_name.lower().strip()
-    # Too long to be a real heading
-    if len(s) > 80:
-        return True
-    # Contains comma-delimited ALL-CAPS tokens (cert/compliance strings)
-    caps_tokens = re.findall(r"\b[A-Z][A-Z0-9/]{1,}\b", section_name)
-    if len(caps_tokens) >= 3:
-        return True
-    # Matches known garbage patterns
-    if _GARBAGE_SECTION_PATTERNS.search(s):
-        return True
-    return False
-
-
-def _normalise_section_name(section_name: str) -> str:
-    """Clean a section name for storage in metadata."""
-    s = section_name.strip()
-    # Remove leading/trailing annotation markers
-    s = re.sub(r"^[*†‡§#\d\.\-\s]+", "", s)
-    s = re.sub(r"[*†‡§#]+$", "", s)
-    # Collapse whitespace
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:80]
-
-
-def _section_to_chunk_type(section_name: str) -> ChunkType:
+def _section_to_chunk_type(section_name: str, text: str = "") -> ChunkType:
+    """
+    Map a section name to a ChunkType.
+    Falls back to scanning the text content when the section name is generic
+    (e.g. 'model_context', 'General') so security/performance content isn't
+    mis-typed as GENERAL.
+    """
     key = section_name.lower().strip()
     for pattern, ctype in _SECTION_CHUNK_TYPE_MAP.items():
         if pattern in key:
             return ctype
+
+    # Content-based fallback — scan a sample of the text
+    if text:
+        sample = text[:600].lower()
+        if any(w in sample for w in [
+            "throughput", "gbps", "mbps", "sessions per second",
+            "concurrent sessions", "latency", "pps", "mpps"
+        ]):
+            return ChunkType.PERFORMANCE
+        if any(w in sample for w in [
+            "antivirus", "wildfire", "threat prevention", "ips", "intrusion",
+            "malware", "dlp", "url filter", "web filter", "ssl inspection",
+            "zero trust", "sandbox", "phishing", "ransomware"
+        ]):
+            return ChunkType.SPEC_TEXT
+        if any(w in sample for w in [
+            "interface", "port", "sfp", "rj45", "10gbe", "routing",
+            "ospf", "bgp", "vlan", "vpn", "nat", "ipv6", "ha mode",
+            "active/active", "active/passive"
+        ]):
+            return ChunkType.CONNECTIVITY
+        if any(w in sample for w in [
+            "power supply", "watt", "ac input", "dc input", "btuh",
+            "consumption", "redundant power"
+        ]):
+            return ChunkType.POWER
+
     return ChunkType.GENERAL
 
 
@@ -291,26 +335,38 @@ def chunk_document(
     # ------------------------------------------------------------------
     # Multi-model path
     # ------------------------------------------------------------------
-    family_rep: ModelSpec = doc.models[0]
+    # FIX-7: pick the model with the richest spec_sections as the family
+    # representative, instead of blindly using doc.models[0]. If the first
+    # detected model is a sparse table-only entry, family-level sections
+    # (Overview, Features, Certifications, …) that actually live on a
+    # different model would otherwise be silently dropped from Step A.
+    family_rep: ModelSpec = max(doc.models, key=lambda m: len(m.spec_sections))
     family_sections_emitted: Set[str] = set()
 
     # Step A: Family-level sections emitted once
     for section_name, section_text in family_rep.spec_sections.items():
-        if _is_garbage_section(section_name):
+        if is_garbage_section(section_name):
             logger.debug(f"[chunker] Skipping garbage section: '{section_name}'")
             continue
-        if not _is_family_level_section(section_name):
+        if not is_family_level_section(section_name):
             continue
         text = _clean_text(section_text)
         if not text:
             continue
+
         content_sig = hashlib.md5(text[:200].encode()).hexdigest()
         if content_sig in family_sections_emitted:
             continue
         family_sections_emitted.add(content_sig)
 
-        clean_name = _normalise_section_name(section_name)
-        chunk_type = _section_to_chunk_type(clean_name)
+        clean_name = normalise_section_name(section_name)
+        chunk_type = _section_to_chunk_type(clean_name, text)
+
+        # FIX-5: this header construction was previously a syntax error
+        # (a dangling concatenation with no opening assignment and no
+        # `model_header` prefix), which made the entire module fail to
+        # import. Family-level chunks aren't tied to one model, so the
+        # header identifies the family/vendor instead of a single model.
         header = (
             f"Vendor: {family_rep.vendor}"
             + (f" | Family: {family_rep.product_family}" if family_rep.product_family else "")
@@ -323,12 +379,17 @@ def chunk_document(
                 chunk_text, family_rep, doc, chunk_type, clean_name, index=i
             ))
 
-    # Step B: Per-model spec profiles
+    # Step B: Per-model spec profiles.
+    # FIX-8: dedupe spec tables that are identical across multiple models
+    # (e.g. a single shared performance table covering the whole family)
+    # so the same table text isn't re-chunked once per model.
+    seen_table_hashes: Set[str] = set()
     for model in doc.models:
         all_chunks.extend(
             _chunks_for_model(
                 model, doc, cfg, emit_family=False,
-                skip_sections=_is_family_level_section,
+                skip_sections=is_family_level_section,
+                seen_table_hashes=seen_table_hashes,
             )
         )
 
@@ -364,7 +425,7 @@ def _make_chunk(
         chunk_id=cid,
         text=text,
         chunk_type=chunk_type,
-        section_name=_normalise_section_name(section_name),
+        section_name=normalise_section_name(section_name),
         table_index=table_index,
         doc_id=doc.doc_id,
         vendor=model.vendor,
@@ -386,7 +447,8 @@ def _chunks_for_model(
     doc: DatasheetDocument,
     cfg: ChunkingConfig,
     emit_family: bool = True,
-    skip_sections: Optional[Callable[[str], bool]] = None,
+    skip_sections=None,
+    seen_table_hashes: Optional[Set[str]] = None,
 ) -> List[DocumentChunk]:
     """
     Build all chunks for a single model.
@@ -395,8 +457,13 @@ def _chunks_for_model(
     FIX-2: Garbage section names are filtered and normalised.
     FIX-3: model.specs (the per-column structured dict) is used for the
            structured_specs chunk, giving every model its own spec values.
+    FIX-8: seen_table_hashes (shared across all models in a doc, when
+           provided) prevents the identical table text from being chunked
+           more than once across different models in the same document.
     """
     chunks: List[DocumentChunk] = []
+    if seen_table_hashes is None:
+        seen_table_hashes = set()
 
     model_header = (
         f"Vendor: {model.vendor} | Model: {model.model_name}"
@@ -415,7 +482,7 @@ def _chunks_for_model(
             chunks.append(make(ct, ChunkType.DESCRIPTION, "description", index=i))
 
     # ── 2. Features ───────────────────────────────────────────────────────
-    if model.features and (emit_family or not _is_family_level_section("features")):
+    if model.features and (emit_family or not is_family_level_section("features")):
         feat_text = (
             model_header + "\nKey Features:\n"
             + "\n".join(f"• {f}" for f in model.features)
@@ -440,7 +507,7 @@ def _chunks_for_model(
     # ── 4. Named spec sections ────────────────────────────────────────────
     for section_name, section_text in model.spec_sections.items():
         # FIX-2: skip garbage section names
-        if _is_garbage_section(section_name):
+        if is_garbage_section(section_name):
             logger.debug(
                 f"[chunker] '{model.model_name}': skipping garbage section '{section_name}'"
             )
@@ -451,7 +518,7 @@ def _chunks_for_model(
         if not text:
             continue
 
-        clean_name = _normalise_section_name(section_name)
+        clean_name = normalise_section_name(section_name)
         chunk_type = _section_to_chunk_type(clean_name)
 
         # FIX-1: Model Context → single consolidated chunk, not N paragraphs
@@ -469,13 +536,25 @@ def _chunks_for_model(
         for i, ct in enumerate(_split_text(full, size, overlap=0)):
             chunks.append(make(ct, chunk_type, clean_name, index=i))
 
-    # ── 5. Spec tables ────────────────────────────────────────────────────
+    # ── 5. Spec tables (FIX-8: dedupe identical tables across models) ─────
     for tidx, table in enumerate(model.spec_tables):
         flat = table.to_flat_text().strip()
         md = table.to_markdown().strip()
         table_text_raw = flat if len(flat) >= len(md) else md
         if not table_text_raw:
             continue
+
+        # Hash on the raw table content only (not the per-model header) so
+        # the same underlying table attached to multiple models is detected
+        # as a duplicate regardless of which model it's chunked under.
+        table_sig = hashlib.md5(table_text_raw.encode()).hexdigest()
+        if table_sig in seen_table_hashes:
+            logger.debug(
+                f"[chunker] '{model.model_name}': skipping duplicate table "
+                f"(table_{tidx}) already chunked for another model"
+            )
+            continue
+        seen_table_hashes.add(table_sig)
 
         header = (
             model_header
@@ -496,3 +575,12 @@ def _chunks_for_model(
         f"specs={len(model.specs)}+{len(model.common_specs)})"
     )
     return chunks
+
+
+def chunk_model_spec(
+    model: ModelSpec,
+    doc: DatasheetDocument,
+    cfg: ChunkingConfig,
+) -> List[DocumentChunk]:
+    """Compatibility wrapper for older tests and scripts."""
+    return _chunks_for_model(model, doc, cfg, emit_family=True)

@@ -29,7 +29,7 @@ class LLMConfig:
     provider: str = "local"
     # ── Reasoning model — used for compliance report generation where
     #    chain-of-thought genuinely helps answer quality.
-    model: str = "qwen3:8b"
+    model: str = "qwen2.5:7b"
     base_url: str = "http://100.98.219.69:11434/v1"
     api_key: str = field(
         default_factory=lambda: os.getenv("LLM_API_KEY", "local")
@@ -157,6 +157,10 @@ class ModelIdentificationConfig:
 
     min_model_occurrences: int = 1
 
+    component_model_prefixes: List[str] = field(default_factory=lambda: [
+        "FIM-", "FPM-", "SPM-", "FMC-", "FPC-", "FAP-",
+    ])
+
 
 @dataclass
 class PipelineConfig:
@@ -177,7 +181,7 @@ class PipelineConfig:
     log_level: str = "INFO"
 
     use_llm_for_model_id: bool = True
-    llm_model: str = "qwen3:8b"
+    llm_model: str = "qwen2.5:7b"
     llm_api_key: str = field(
         default_factory=lambda: os.getenv("LLM_API_KEY", "local")
     )

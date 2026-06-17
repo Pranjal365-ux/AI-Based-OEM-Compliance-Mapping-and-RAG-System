@@ -55,7 +55,7 @@ NO_SCORE         = 0.0
 
 # Match OLLAMA_NUM_PARALLEL on your workstation.
 # 2 = safe default for a single CPU-only Ollama instance.
-EVAL_WORKERS = 1
+EVAL_WORKERS = 2
 
 
 # ══════════════════════════════════════════════════════════════════════════════

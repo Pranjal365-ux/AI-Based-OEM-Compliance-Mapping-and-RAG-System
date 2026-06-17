@@ -48,11 +48,23 @@ _UNIT_ALIASES: dict[str, list[str]] = {
     "mb":       ["mb", "megabyte", "megabytes"],
     "users":    ["users", "user", "concurrent users"],
     "sessions": ["sessions", "session", "concurrent sessions"],
+    "sessions/s": ["sessions/s", "sessions per second", "session per second", "sps"],
+    "connections": ["connections", "connection", "concurrent connections"],
     "cps":      ["cps", "connections per second"],
     "rps":      ["rps", "requests per second"],
     "eps":      ["eps", "events per second"],
     "m":        ["million", " m ", "m concurrent"],
 }
+
+_UNIT_INFERENCE: list[tuple[str, list[str]]] = [
+    ("sessions/s", ["sessions per second", "new sessions per second"]),
+    ("cps", ["connections per second", " cps"]),
+    ("rps", ["requests per second", " rps"]),
+    ("sessions", ["concurrent sessions", "sessions"]),
+    ("connections", ["concurrent connections", "connections"]),
+    ("users", ["users", "ssl vpn users"]),
+    ("gb", ["hard drive", "storage", "disk"]),
+]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -156,37 +168,33 @@ def _numeric_precheck(
 
     Handles K/M suffixes in both the requirement value and evidence text.
     """
-    if not req.value or req.value in ("true", "") or not req.unit:
+    if not req.value or req.value in ("true", ""):
         return None
 
     try:
-        raw = req.value.replace(",", "").upper()
-        mult = 1
-        if raw.endswith("K"):
-            mult, raw = 1_000, raw[:-1]
-        elif raw.endswith("M"):
-            mult, raw = 1_000_000, raw[:-1]
-        threshold = float(raw) * mult
+        threshold = _parse_number(req.value)
     except ValueError:
         return None
 
-    unit_lower    = req.unit.lower()
+    unit_lower = (req.unit or _infer_unit(req.requirement) or "").lower()
+    if not unit_lower:
+        return None
+    display_unit = req.unit or unit_lower
     unit_variants = _UNIT_ALIASES.get(unit_lower, [unit_lower])
     combined_text = "\n".join(c.text for c in evidence).lower()
 
-    pattern = rf"(\d[\d,\.]*[km]?)\s*(?:{'|'.join(re.escape(u) for u in unit_variants)})"
+    unit_pattern = "|".join(re.escape(u) for u in unit_variants)
+    patterns = [
+        rf"(?<![a-z])(\d[\d,\.]*\s*(?:[km]|million|thousand)?)\s*(?:{unit_pattern})",
+        rf"(?:{unit_pattern})\s*(?:[:=\-]|\bis\b|\bare\b)?\s*(\d[\d,\.]*\s*(?:[km]|million|thousand)?)",
+    ]
     found_values: list[float] = []
-    for m in re.finditer(pattern, combined_text, re.IGNORECASE):
-        try:
-            vs = m.group(1).replace(",", "").upper()
-            vm = 1
-            if vs.endswith("K"):
-                vm, vs = 1_000, vs[:-1]
-            elif vs.endswith("M"):
-                vm, vs = 1_000_000, vs[:-1]
-            found_values.append(float(vs) * vm)
-        except ValueError:
-            pass
+    for pattern in patterns:
+        for m in re.finditer(pattern, combined_text, re.IGNORECASE):
+            try:
+                found_values.append(_parse_number(m.group(1)))
+            except ValueError:
+                pass
 
     if not found_values:
         return None   # No numeric evidence — let LLM decide
@@ -200,8 +208,8 @@ def _numeric_precheck(
                 "status":        ComplianceStatus.FULL,
                 "confidence":    0.92,
                 "justification": (
-                    f"Evidence confirms {best_val:g} {req.unit}, "
-                    f"meeting the required >= {threshold:g} {req.unit}."
+                    f"Evidence confirms {best_val:g} {display_unit}, "
+                    f"meeting the required >= {threshold:g} {display_unit}."
                 ),
                 "gap": "",
             }
@@ -210,23 +218,46 @@ def _numeric_precheck(
                 "status":        ComplianceStatus.PARTIAL,
                 "confidence":    0.80,
                 "justification": (
-                    f"Evidence shows {best_val:g} {req.unit}, which is below "
-                    f"the required {threshold:g} {req.unit} but within 30%."
+                    f"Evidence shows {best_val:g} {display_unit}, which is below "
+                    f"the required {threshold:g} {display_unit} but within 30%."
                 ),
-                "gap": f"Requires {threshold:g} {req.unit}; found {best_val:g} {req.unit}.",
+                "gap": f"Requires {threshold:g} {display_unit}; found {best_val:g} {display_unit}.",
             }
         else:
             return {
                 "status":        ComplianceStatus.NO,
                 "confidence":    0.88,
                 "justification": (
-                    f"Evidence shows only {best_val:g} {req.unit}; "
-                    f"requirement is >= {threshold:g} {req.unit}."
+                    f"Evidence shows only {best_val:g} {display_unit}; "
+                    f"requirement is >= {threshold:g} {display_unit}."
                 ),
-                "gap": f"Requires {threshold:g} {req.unit}; found {best_val:g} {req.unit}.",
+                "gap": f"Requires {threshold:g} {display_unit}; found {best_val:g} {display_unit}.",
             }
 
     # Unsupported operator — let LLM handle
+    return None
+
+
+def _parse_number(value: str) -> float:
+    raw = str(value).replace(",", "").strip().upper()
+    raw = re.sub(r"\s+", "", raw)
+    multiplier = 1
+    if raw.endswith("K"):
+        multiplier, raw = 1_000, raw[:-1]
+    elif raw.endswith("M"):
+        multiplier, raw = 1_000_000, raw[:-1]
+    elif raw.endswith("MILLION"):
+        multiplier, raw = 1_000_000, raw[:-7]
+    elif raw.endswith("THOUSAND"):
+        multiplier, raw = 1_000, raw[:-8]
+    return float(raw) * multiplier
+
+
+def _infer_unit(requirement: str) -> Optional[str]:
+    lower = requirement.lower()
+    for unit, signals in _UNIT_INFERENCE:
+        if any(signal in lower for signal in signals):
+            return unit
     return None
 
 
@@ -337,4 +368,3 @@ def _score_to_status(score: float) -> ComplianceStatus:
 
 def _clamp(v: float) -> float:
     return max(0.0, min(1.0, v))
-

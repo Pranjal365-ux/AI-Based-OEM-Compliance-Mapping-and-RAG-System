@@ -457,10 +457,30 @@ def _parse_vendor_from_text(header_text: str) -> Tuple[str, float]:
         "google cloud": "Google Cloud",
     }
 
+    product_brand_aliases = {
+        "big-ip": "F5",
+        "big ip": "F5",
+        "advanced waf": "F5",
+        "fortigate": "Fortinet",
+        "fortiguard": "Fortinet",
+        "pan-os": "Palo Alto Networks",
+        "wildfire": "Palo Alto Networks",
+    }
+
     text_lower = header_text.lower()
-    for key, name in sorted(known_vendors.items(), key=lambda item: -len(item[0])):
-        if _vendor_key_in_text(key, text_lower):
-            return name, 0.9
+    candidates: dict[str, float] = {}
+    all_aliases = {**known_vendors, **product_brand_aliases}
+    for key, name in all_aliases.items():
+        score = _vendor_alias_score(key, text_lower, lines)
+        if score <= 0:
+            continue
+        if key in product_brand_aliases:
+            score += 0.08
+        candidates[name] = max(candidates.get(name, 0.0), score)
+
+    if candidates:
+        name, score = max(candidates.items(), key=lambda item: item[1])
+        return name, min(score, 0.95)
 
     # Fallback: take first line that looks like a company name
     for line in lines[:5]:
@@ -483,13 +503,29 @@ def _parse_vendor_from_text(header_text: str) -> Tuple[str, float]:
 
 def _vendor_key_in_text(key: str, text_lower: str) -> bool:
     """Match vendor names as terms, so 'intel' does not match 'intelligence'."""
+    return _vendor_alias_score(key, text_lower, []) > 0
+
+
+def _vendor_alias_score(key: str, text_lower: str, lines: List[str]) -> float:
+    """Score a vendor/brand alias by term match strength and page position."""
     key = key.strip().lower()
     if not key:
-        return False
+        return 0.0
     pattern = r"(?<![a-z0-9])" + r"\s+".join(
         re.escape(part) for part in key.split()
     ) + r"(?![a-z0-9])"
-    return re.search(pattern, text_lower) is not None
+    if re.search(pattern, text_lower) is None:
+        return 0.0
+
+    score = 0.82
+    for idx, line in enumerate(lines[:8]):
+        line_lower = line.lower()
+        if re.search(pattern, line_lower):
+            score += max(0.0, 0.08 - (idx * 0.01))
+            if len(line.split()) <= 8:
+                score += 0.03
+            break
+    return score
 
 
 # ─── Full Document Text Extraction ─────────────────────────────────────────────

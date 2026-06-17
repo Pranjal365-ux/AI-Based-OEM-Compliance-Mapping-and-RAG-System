@@ -34,10 +34,27 @@ from models.schemas import Requirement
 logger = logging.getLogger(__name__)
 
 REPORTS_DIR = Path(DEFAULT_CONFIG.rfp.output_dir).parent / "compliance_reports"
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Max evidence entries shown per product in the report
 MAX_EVIDENCE_ENTRIES = 10
+
+
+def _ensure_reports_dir() -> None:
+    """
+    Create REPORTS_DIR lazily, on first write, instead of at import time.
+
+    Bug fixed: the directory was previously created as a module-level side
+    effect (`REPORTS_DIR.mkdir(...)` ran the instant `reporter` was imported
+    anywhere — e.g. from a unit test that never calls generate_report()).
+    That meant:
+      • Importing this module could fail/crash before DEFAULT_CONFIG was
+        fully populated in some startup orders.
+      • Directories got created on disk just from `import compliance.reporter`,
+        which is surprising and pollutes test environments / read-only mounts.
+    Creating it lazily, right before the first file write, removes the
+    import-time side effect entirely.
+    """
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -74,9 +91,10 @@ def generate_report(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _save_json(report: ComplianceReport) -> Path:
+    _ensure_reports_dir()
     out = REPORTS_DIR / f"compliance_{report.report_id}.json"
     with open(out, "w", encoding="utf-8") as f:
-        f.write(report.model_dump_json(indent=2, default=str))
+        f.write(report.model_dump_json(indent=2))
     logger.info(f"✓ JSON report → {out}")
     return out
 
@@ -86,6 +104,7 @@ def _save_json(report: ComplianceReport) -> Path:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _save_markdown(report: ComplianceReport) -> Path:
+    _ensure_reports_dir()
     out = REPORTS_DIR / f"compliance_{report.report_id}.md"
     with open(out, "w", encoding="utf-8") as f:
         f.write(_build_markdown(report))

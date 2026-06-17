@@ -235,6 +235,8 @@ class VectorStoreManager:
                 "chunk_type": meta.get("chunk_type", ""),
                 "product_family": meta.get("product_family", ""),
                 "source_file": meta.get("source_file", ""),
+                "page_start": meta.get("page_start", 0),
+                "page_end": meta.get("page_end", 0),
                 "metadata": meta,
             })
 
