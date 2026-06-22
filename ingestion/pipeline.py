@@ -11,6 +11,8 @@ Changes from original
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 import time
 import uuid
@@ -379,6 +381,20 @@ def _safe_console_log(message: object) -> None:
 
 
 def _guess_vendor_from_filename(stem: str) -> Optional[str]:
+    """
+    Last-resort vendor guess from the filename, only used when text/OCR-
+    based vendor detection (detect_vendor) returns low confidence — see
+    the call site in ingest_file().
+
+    The built-in map below is a convenience default covering common
+    networking/security OEMs; it is NOT required for the pipeline to work
+    with other vendors (real detection reads the document itself). To
+    extend or override it for your own vendor catalog without touching
+    code, set VENDOR_FILENAME_MAP as a JSON object in the environment,
+    e.g.:
+      VENDOR_FILENAME_MAP={"acme": "Acme Corp", "globex": "Globex Inc"}
+    Entries here are merged on top of (and can override) the defaults.
+    """
     _MAP = {
         "fortinet": "Fortinet",
         "opentext": "OpenText",
@@ -396,6 +412,15 @@ def _guess_vendor_from_filename(stem: str) -> Optional[str]:
         "dell": "Dell",
         "ibm": "IBM",
     }
+    extra_raw = os.getenv("VENDOR_FILENAME_MAP", "")
+    if extra_raw:
+        try:
+            extra = json.loads(extra_raw)
+            if isinstance(extra, dict):
+                _MAP.update({str(k).lower(): str(v) for k, v in extra.items()})
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("VENDOR_FILENAME_MAP is not valid JSON — ignoring")
+
     stem_lower = stem.lower()
     for key, vendor in _MAP.items():
         if key in stem_lower:

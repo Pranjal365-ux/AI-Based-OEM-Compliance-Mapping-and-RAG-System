@@ -213,9 +213,9 @@ def main() -> int:
     config = DEFAULT_CONFIG
 
     # Apply API key from env
-    api_key = os.getenv("GROQ_API_KEY", "")
+    api_key = os.getenv("LLM_API_KEY", "")
     if api_key:
-        config.groq_api_key = api_key
+        config.llm_api_key = api_key
 
     pipeline = OEMIngestionPipeline(config)
 

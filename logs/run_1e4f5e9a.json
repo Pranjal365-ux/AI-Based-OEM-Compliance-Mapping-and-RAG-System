@@ -1,0 +1,79 @@
+{
+  "run_id": "1e4f5e9a",
+  "started_at": "2026-06-19T06:44:18.670418Z",
+  "completed_at": "2026-06-19T06:50:07.476752Z",
+  "total_files": 6,
+  "successful": 6,
+  "failed": 0,
+  "skipped": 0,
+  "total_models_extracted": 16,
+  "total_chunks_created": 525,
+  "file_results": [
+    {
+      "file_path": "data\\raw\\big-ip-advanced-waf-datasheet.pdf",
+      "doc_id": "6ebaf25b9fe08765",
+      "status": "completed",
+      "vendor": "F5",
+      "models_found": 1,
+      "chunks_created": 38,
+      "processing_time_seconds": 15.53,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\firewall-features-overview.pdf",
+      "doc_id": "52ddfdeaba7c9055",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 1,
+      "chunks_created": 26,
+      "processing_time_seconds": 12.19,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\fortigate-1800f-series.pdf",
+      "doc_id": "aee4c89087966855",
+      "status": "completed",
+      "vendor": "Fortinet",
+      "models_found": 4,
+      "chunks_created": 178,
+      "processing_time_seconds": 79.77,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\fortigate-7000f-series.pdf",
+      "doc_id": "8ce8badd49c9fb3d",
+      "status": "completed",
+      "vendor": "Fortinet",
+      "models_found": 6,
+      "chunks_created": 267,
+      "processing_time_seconds": 150.34,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\opentext-siem-open-data-platform-ds-en.pdf",
+      "doc_id": "3ad5d89735767206",
+      "status": "completed",
+      "vendor": "OpenText",
+      "models_found": 1,
+      "chunks_created": 16,
+      "processing_time_seconds": 6.85,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\pa-3200-series.pdf",
+      "doc_id": "bf0c66afec5eba38",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 3,
+      "chunks_created": 0,
+      "processing_time_seconds": 83.87,
+      "warnings": [],
+      "error_message": ""
+    }
+  ]
+}

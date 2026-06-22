@@ -195,13 +195,25 @@ class VectorStoreManager:
             id, text, score (0-1), vendor, model_name, chunk_type, metadata
         """
         where: Dict[str, Any] = {}
-        if vendor:
-            where["vendor"] = {"$eq": vendor}
-        if model_name:
-            where["model_name"] = {"$eq": model_name}
-        if chunk_type:
-            where["chunk_type"] = {"$eq": chunk_type.value}
+        filters = []
 
+        if vendor:
+            filters.append({"vendor": {"$eq": vendor}})
+
+        if model_name:
+            filters.append({"model_name": {"$eq": model_name}})
+
+        if chunk_type:
+            filters.append({"chunk_type": {"$eq": chunk_type.value}})
+
+        where = None
+
+        if len(filters) == 1:
+            where = filters[0]
+
+        elif len(filters) > 1:
+            where = {"$and": filters}
+        
         query_embedding = self.embed_texts([query])[0]
 
         kwargs: Dict[str, Any] = {

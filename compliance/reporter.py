@@ -94,7 +94,7 @@ def _save_json(report: ComplianceReport) -> Path:
     _ensure_reports_dir()
     out = REPORTS_DIR / f"compliance_{report.report_id}.json"
     with open(out, "w", encoding="utf-8") as f:
-        f.write(report.model_dump_json(indent=2))
+        json.dump(report.model_dump(mode="json"), f, indent=2, ensure_ascii=False, default=str)
     logger.info(f"✓ JSON report → {out}")
     return out
 

@@ -18,9 +18,12 @@ from pydantic import BaseModel, Field
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ComplianceStatus(str, Enum):
-    FULL    = "Full Match"
-    PARTIAL = "Partial Match"
-    NO      = "No Match"
+    FULL           = "Full Match"
+    PARTIAL        = "Partial Match"
+    NO             = "No Match"             # Evidence contradicts or shows inadequacy
+    NOT_FOUND      = "Not Found"            # No evidence in datasheet at all
+    UNSUPPORTED    = "Unsupported"          # Product explicitly doesn't support this
+    NOT_APPLICABLE = "Not Applicable"       # Requirement doesn't apply (procurement/commercial)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

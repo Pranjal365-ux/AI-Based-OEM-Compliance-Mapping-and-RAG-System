@@ -3,18 +3,28 @@ Compliance Engine – Matcher Module
 ====================================
 Evaluates compliance of one (requirement, product) pair.
 
-Speed optimisations (CPU-only workstation, no GPU)
+Rate-limit optimisations (Groq 250K TPM / 1K RPM)
 ---------------------------------------------------
+KEY CHANGE: batch_evaluate_requirements() groups up to BATCH_SIZE
+requirements that need LLM evaluation into a single API call, returning
+a JSON array of verdicts.  This cuts LLM calls by ~10x for a typical
+50-requirement RFP and eliminates the most common cause of 429s.
+
+Individual evaluate_requirement() is kept for the ranker's per-requirement
+ThreadPoolExecutor interface — it now delegates to the batch path
+transparently via a 1-item batch, or can be called directly for tests.
+
+Other optimisations
+-------------------
 1. No-evidence short-circuit  — zero LLM calls when KB has nothing for
    this product on this requirement.
 2. Numeric pre-check          — regex confirms/rejects threshold reqs
    without any LLM call (~20-25% of requirements).
 3. High-score short-circuit   — cosine ≥ 0.88 with no numeric unit →
    Full Match without an LLM call.
-4. generate_fast()            — routes to the fast (non-reasoning) model,
-   ~15 sec/call on CPU vs ~60-90 sec for a reasoning model.
-5. Tight token budget         — VERDICT_MAX_TOKENS=400 keeps generation fast.
-6. Truncated evidence         — max 1 200 chars total evidence per call.
+4. generate_fast()            — routes to the fast (non-reasoning) model.
+5. Tight token budget         — BATCH_MAX_TOKENS=3000 covers 10 verdicts.
+6. Truncated evidence         — max EVIDENCE_PER_REQ chars per requirement.
 """
 from __future__ import annotations
 
@@ -22,7 +32,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from models.schemas import Requirement
 from compliance.schemas import ComplianceStatus, EvidenceChunk, RequirementResult
@@ -31,9 +41,14 @@ from services.llm_services import llm
 logger = logging.getLogger(__name__)
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-MAX_EVIDENCE_CHARS = 1200   # total chars of evidence sent per LLM call
-VERDICT_MAX_TOKENS = 400    # JSON verdict is always <100 tokens; 400 = margin
+EVIDENCE_PER_REQ   = 600    # chars of evidence included per requirement in a batch
+BATCH_MAX_TOKENS   = 3000   # token budget for a batch LLM call (covers ~10 verdicts)
 HIGH_SCORE_CUTOFF  = 0.88   # cosine threshold for no-LLM Full Match
+BATCH_SIZE         = 10     # requirements per LLM call (tune down if hitting TPM limits)
+
+# Legacy alias kept so callers that import MAX_EVIDENCE_CHARS don't break
+MAX_EVIDENCE_CHARS = EVIDENCE_PER_REQ * BATCH_SIZE
+VERDICT_MAX_TOKENS = BATCH_MAX_TOKENS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -71,25 +86,22 @@ _UNIT_INFERENCE: list[tuple[str, list[str]]] = [
 # PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
 
-def evaluate_requirement(
-    req:        Requirement,
+def evaluate_requirement_no_llm(
+    req:        "Requirement",
     evidence:   List[EvidenceChunk],
     vendor:     str,
     model_name: str,
-) -> RequirementResult:
+) -> Optional[RequirementResult]:
     """
-    Evaluate compliance of one requirement against OEM evidence chunks
-    for a specific product.  Returns a RequirementResult with verdict.
+    Run all zero-LLM evaluation paths.
 
-    Evaluation order
-    ----------------
-    1. Filter evidence to this (vendor, model_name) pair.
-    2. If no evidence → No Match (zero LLM calls).
-    3. If requirement has a numeric threshold → regex pre-check.
-    4. If top cosine score ≥ HIGH_SCORE_CUTOFF and no unit → Full Match.
-    5. Otherwise → LLM verdict via fast model.
+    Returns a RequirementResult if a verdict can be determined without
+    an LLM call (no evidence, numeric pre-check, high-score short-circuit).
+    Returns None if the LLM must be consulted.
+
+    Used by the ranker's batch evaluation loop to separate cheap checks
+    from expensive LLM calls, so the latter can be batched together.
     """
-    # Step 1 — filter to this product
     product_evidence = [
         c for c in evidence
         if c.vendor == vendor and c.model_name == model_name
@@ -100,13 +112,13 @@ def evaluate_requirement(
         requirement    = req.requirement,
         category       = req.category,
         mandatory      = req.mandatory,
-        operator       = req.operator,
-        value          = req.value,
-        unit           = req.unit,
-        evidence       = product_evidence[:5],   # store top-5 for report
+        operator       = getattr(req, "operator", None),
+        value          = getattr(req, "value", None),
+        unit           = getattr(req, "unit", None),
+        evidence       = product_evidence[:5],
     )
 
-    # Step 2 — no-evidence short-circuit
+    # No evidence → No Match
     if not product_evidence:
         result.status        = ComplianceStatus.NO
         result.confidence    = 0.95
@@ -114,7 +126,7 @@ def evaluate_requirement(
         result.gap           = req.requirement
         return result
 
-    # Step 3 — numeric pre-check (avoids LLM for ~20-25% of requirements)
+    # Numeric pre-check
     fast = _numeric_precheck(req, product_evidence)
     if fast is not None:
         result.status        = fast["status"]
@@ -123,9 +135,9 @@ def evaluate_requirement(
         result.gap           = fast.get("gap", "")
         return result
 
-    # Step 4 — high-score short-circuit (no unit to verify numerically)
+    # High-score short-circuit (no unit to verify numerically)
     top_score = product_evidence[0].score
-    if top_score >= HIGH_SCORE_CUTOFF and not req.unit:
+    if top_score >= HIGH_SCORE_CUTOFF and not getattr(req, "unit", None):
         result.status        = ComplianceStatus.FULL
         result.confidence    = round(top_score, 2)
         result.justification = (
@@ -135,23 +147,56 @@ def evaluate_requirement(
         result.gap = ""
         return result
 
-    # Step 5 — LLM verdict via fast (non-reasoning) model
-    prompt  = _build_verdict_prompt(req, product_evidence, vendor, model_name)
-    verdict = _call_llm(prompt)
+    return None   # needs LLM
 
+
+def evaluate_requirement(
+    req:        "Requirement",
+    evidence:   List[EvidenceChunk],
+    vendor:     str,
+    model_name: str,
+) -> RequirementResult:
+    """
+    Single-requirement evaluation (pre-checks + single-item LLM batch).
+    Kept for backward compatibility and unit tests — the ranker now uses
+    evaluate_requirement_no_llm() + batch_evaluate_requirements() instead.
+    """
+    result = evaluate_requirement_no_llm(req, evidence, vendor, model_name)
+    if result is not None:
+        return result
+
+    # Fall through to single-item batch call
+    product_evidence = [
+        c for c in evidence
+        if c.vendor == vendor and c.model_name == model_name
+    ]
+    verdicts = batch_evaluate_requirements([(req, evidence)], vendor, model_name)
+    verdict = verdicts.get(req.requirement_id)
+    top_score = product_evidence[0].score if product_evidence else 0.0
+
+    result = RequirementResult(
+        requirement_id = req.requirement_id,
+        requirement    = req.requirement,
+        category       = req.category,
+        mandatory      = req.mandatory,
+        operator       = getattr(req, "operator", None),
+        value          = getattr(req, "value", None),
+        unit           = getattr(req, "unit", None),
+        evidence       = product_evidence[:5],
+    )
     if verdict:
         result.status        = _parse_status(verdict.get("status", ""))
         result.confidence    = _clamp(float(verdict.get("confidence", 0.5)))
         result.justification = str(verdict.get("justification", "")).strip()
         result.gap           = str(verdict.get("gap", "")).strip()
     else:
-        # LLM parse failed — fall back to cosine heuristic
         result.status        = _score_to_status(top_score)
         result.confidence    = round(top_score, 2)
         result.justification = "Verdict inferred from similarity score (LLM parse failed)."
         result.gap           = "" if top_score >= 0.75 else req.requirement
-
     return result
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -315,11 +360,109 @@ def _build_verdict_prompt(
 def _call_llm(prompt: str) -> Optional[dict]:
     """Call the fast (non-reasoning) model for a yes/no compliance verdict."""
     try:
-        raw = llm.generate_fast(prompt, max_tokens=VERDICT_MAX_TOKENS, temperature=0)
+        raw = llm.generate_fast(prompt, max_tokens=BATCH_MAX_TOKENS, temperature=0)
         return _parse_verdict(raw)
     except Exception as exc:
         logger.warning(f"LLM verdict call failed: {exc}")
         return None
+
+
+def batch_evaluate_requirements(
+    reqs_and_evidence: List[Tuple["Requirement", List[EvidenceChunk]]],
+    vendor: str,
+    model_name: str,
+) -> Dict[str, dict]:
+    """
+    Evaluate multiple requirements in a SINGLE LLM call.
+
+    This is the primary tool for avoiding rate limits. Instead of one API
+    call per requirement (the old default), this groups up to BATCH_SIZE
+    requirements that all need LLM evaluation and asks for all verdicts at
+    once in a JSON array response.
+
+    Parameters
+    ----------
+    reqs_and_evidence : list of (Requirement, evidence_chunks) pairs —
+        ONLY requirements that actually need LLM evaluation (i.e. they
+        passed no-evidence and numeric pre-checks without a verdict).
+    vendor, model_name : product being evaluated.
+
+    Returns
+    -------
+    dict mapping requirement_id → verdict dict
+        {status, confidence, justification, gap}
+    """
+    if not reqs_and_evidence:
+        return {}
+
+    items = []
+    for req, evidence in reqs_and_evidence:
+        product_ev = [c for c in evidence if c.vendor == vendor and c.model_name == model_name]
+        chars = EVIDENCE_PER_REQ // max(1, min(len(product_ev), 4))
+        ev_text = ""
+        for i, chunk in enumerate(product_ev[:4], 1):
+            snippet = chunk.text[:chars].replace("\n", " ").strip()
+            src = Path(chunk.source_file).name if chunk.source_file else "KB"
+            page = f" p.{chunk.page_start}" if chunk.page_start else ""
+            ev_text += f"[{i}] {src}{page} (sim={chunk.score:.2f}): {snippet}\n"
+
+        threshold = ""
+        if req.value and req.value not in ("true", "") and req.unit:
+            threshold = f" | threshold: {req.operator or '>='} {req.value} {req.unit}"
+
+        items.append({
+            "id": req.requirement_id,
+            "mandatory": req.mandatory,
+            "requirement": req.requirement + threshold,
+            "evidence": ev_text.strip(),
+        })
+
+    prompt = (
+        f"Product: {vendor} – {model_name}\n"
+        f"Task: For each requirement below, return a compliance verdict based ONLY on the provided evidence.\n\n"
+        f"Rules:\n"
+        f"- Only use what is explicitly stated in the evidence.\n"
+        f"- For numeric thresholds, evidence must state a value meeting the threshold.\n"
+        f"- Partial Match = capability present but not at required level, or strongly implied.\n"
+        f"- No Match = not mentioned or contradicted.\n\n"
+        f"Requirements:\n"
+    )
+    for item in items:
+        prompt += (
+            f"\n--- REQ {item['id']} ({'MANDATORY' if item['mandatory'] else 'optional'}) ---\n"
+            f"Requirement: {item['requirement']}\n"
+            f"Evidence:\n{item['evidence']}\n"
+        )
+
+    prompt += (
+        "\n\nReply with ONLY a JSON array, one object per requirement, in the same order:\n"
+        '[{"id":"<req_id>","status":"Full Match"|"Partial Match"|"No Match",'
+        '"confidence":<0.0-1.0>,"justification":"<one sentence>","gap":"<or empty>"}]\n'
+        "No markdown. No extra text. JSON array only."
+    )
+
+    try:
+        raw = llm.generate_fast(prompt, max_tokens=BATCH_MAX_TOKENS, temperature=0)
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw).strip()
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        # Find first [
+        bracket = raw.find("[")
+        if bracket != -1:
+            raw = raw[bracket:]
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            return {}
+        return {
+            item["id"]: item
+            for item in data
+            if isinstance(item, dict) and "id" in item and "status" in item
+        }
+    except Exception as exc:
+        logger.warning(f"[matcher] Batch LLM call failed: {exc}")
+        return {}
+
+
 
 
 def _parse_verdict(raw: str) -> Optional[dict]:

@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -156,46 +155,74 @@ def _evaluate_product(
                 if chunk.source_file:
                     source_files.add(Path(chunk.source_file).name)
 
-    # ── Parallel requirement evaluation ───────────────────────────────────────
+    # ── Batch evaluation (10x fewer LLM calls → far fewer 429s) ─────────────
+    #
+    # Strategy:
+    #   1. Run all cheap pre-checks (no-evidence, numeric, high-score) first
+    #      — these generate zero LLM calls.
+    #   2. Collect the requirements that actually need LLM judgement.
+    #   3. Send them to matcher.batch_evaluate_requirements() in groups of
+    #      BATCH_SIZE (default 10) — one API call per batch instead of one
+    #      per requirement.
+    #
     req_results: Dict[str, RequirementResult] = {}
+    needs_llm: list = []   # (req, evidence_chunks)
 
-    with ThreadPoolExecutor(max_workers=EVAL_WORKERS) as pool:
-        future_to_req = {
-            pool.submit(
-                matcher.evaluate_requirement,
-                req,
-                evidence_map.get(req.requirement_id, []),
-                vendor,
-                model_name,
-            ): req
-            for req in requirements
-        }
+    for req in requirements:
+        evidence = evidence_map.get(req.requirement_id, [])
+        result = matcher.evaluate_requirement_no_llm(
+            req, evidence, vendor, model_name
+        )
+        if result is not None:
+            req_results[req.requirement_id] = result
+        else:
+            needs_llm.append((req, evidence))
 
-        done = 0
-        for future in as_completed(future_to_req):
-            req  = future_to_req[future]
-            done += 1
-            try:
-                result = future.result()
-            except Exception as exc:
-                logger.warning(
-                    f"    Matcher failed for {req.requirement_id}: {exc} — defaulting No Match"
-                )
-                result = RequirementResult(
-                    requirement_id = req.requirement_id,
-                    requirement    = req.requirement,
-                    category       = req.category,
-                    mandatory      = req.mandatory,
-                    status         = ComplianceStatus.NO,
-                    confidence     = 0.0,
-                    justification  = f"Evaluation error: {exc}",
-                    gap            = req.requirement,
-                )
+    # Batch the LLM calls
+    for batch_start in range(0, len(needs_llm), matcher.BATCH_SIZE):
+        batch = needs_llm[batch_start: batch_start + matcher.BATCH_SIZE]
+        verdicts = matcher.batch_evaluate_requirements(batch, vendor, model_name)
+
+        for req, evidence in batch:
+            verdict = verdicts.get(req.requirement_id)
+            product_evidence = [
+                c for c in evidence
+                if c.vendor == vendor and c.model_name == model_name
+            ]
+            top_score = product_evidence[0].score if product_evidence else 0.0
+
+            result = RequirementResult(
+                requirement_id = req.requirement_id,
+                requirement    = req.requirement,
+                category       = req.category,
+                mandatory      = req.mandatory,
+                operator       = req.operator,
+                value          = req.value,
+                unit           = req.unit,
+                evidence       = product_evidence[:5],
+            )
+            if verdict:
+                result.status        = matcher._parse_status(verdict.get("status", ""))
+                result.confidence    = matcher._clamp(float(verdict.get("confidence", 0.5)))
+                result.justification = str(verdict.get("justification", "")).strip()
+                result.gap           = str(verdict.get("gap", "")).strip()
+            else:
+                # Batch parse failed for this item — cosine fallback
+                result.status        = matcher._score_to_status(top_score)
+                result.confidence    = round(top_score, 2)
+                result.justification = "Verdict inferred from similarity score (LLM batch failed)."
+                result.gap           = "" if top_score >= 0.75 else req.requirement
             req_results[req.requirement_id] = result
 
-            # Live progress indicator every 10 requirements
-            if done % 10 == 0 or done == len(requirements):
-                print(f"    {done}/{len(requirements)} requirements evaluated…", flush=True)
+        done_count = min(batch_start + matcher.BATCH_SIZE, len(needs_llm))
+        pre_check_count = len(req_results) - done_count
+        print(
+            f"    {len(req_results)}/{len(requirements)} evaluated "
+            f"({pre_check_count} pre-checks, {done_count} LLM, "
+            f"{len(needs_llm) // matcher.BATCH_SIZE + 1} batches total)…",
+            flush=True,
+        )
+
 
     # ── Aggregate scores in original requirement order ─────────────────────────
     mandatory_earned   = 0.0

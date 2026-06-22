@@ -1,0 +1,145 @@
+{
+  "run_id": "857b4d28",
+  "started_at": "2026-06-22T10:25:32.817537Z",
+  "completed_at": "2026-06-22T11:07:07.934877Z",
+  "total_files": 12,
+  "successful": 12,
+  "failed": 0,
+  "skipped": 0,
+  "total_models_extracted": 113,
+  "total_chunks_created": 4068,
+  "file_results": [
+    {
+      "file_path": "data\\raw\\big-ip-advanced-waf-datasheet.pdf",
+      "doc_id": "6ebaf25b9fe08765",
+      "status": "completed",
+      "vendor": "F5",
+      "models_found": 1,
+      "chunks_created": 38,
+      "processing_time_seconds": 29.65,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\big-ip-platforms-datasheet.pdf",
+      "doc_id": "1a2c1fc006732a02",
+      "status": "completed",
+      "vendor": "F5",
+      "models_found": 62,
+      "chunks_created": 2385,
+      "processing_time_seconds": 1033.88,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\cisco-firepower-ngfw-datasheet.pdf",
+      "doc_id": "5e597f6723431739",
+      "status": "completed",
+      "vendor": "Cisco",
+      "models_found": 1,
+      "chunks_created": 116,
+      "processing_time_seconds": 65.1,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\datasheet-gen7-nsa.pdf",
+      "doc_id": "1bad1bfc4889c2dc",
+      "status": "completed",
+      "vendor": "SonicWall",
+      "models_found": 4,
+      "chunks_created": 102,
+      "processing_time_seconds": 52.29,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\firewall-features-overview.pdf",
+      "doc_id": "52ddfdeaba7c9055",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 1,
+      "chunks_created": 26,
+      "processing_time_seconds": 19.0,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\fortigate-1800f-series.pdf",
+      "doc_id": "aee4c89087966855",
+      "status": "completed",
+      "vendor": "Fortinet",
+      "models_found": 24,
+      "chunks_created": 1010,
+      "processing_time_seconds": 439.32,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\fortigate-7000f-series.pdf",
+      "doc_id": "8ce8badd49c9fb3d",
+      "status": "completed",
+      "vendor": "Fortinet",
+      "models_found": 9,
+      "chunks_created": 167,
+      "processing_time_seconds": 462.83,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\opentext-siem-open-data-platform-ds-en.pdf",
+      "doc_id": "3ad5d89735767206",
+      "status": "completed",
+      "vendor": "OpenText",
+      "models_found": 1,
+      "chunks_created": 16,
+      "processing_time_seconds": 11.36,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\pa-3200-series.pdf",
+      "doc_id": "bf0c66afec5eba38",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 3,
+      "chunks_created": 51,
+      "processing_time_seconds": 257.81,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\pa-3400-series.pdf",
+      "doc_id": "15d8cd06ba2ab1cf",
+      "status": "completed",
+      "vendor": "Palo Alto Networks",
+      "models_found": 5,
+      "chunks_created": 104,
+      "processing_time_seconds": 69.49,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\srx4600-firewall-datasheet.pdf",
+      "doc_id": "5a4f1aa7c1eb7f74",
+      "status": "completed",
+      "vendor": "Juniper Networks",
+      "models_found": 1,
+      "chunks_created": 40,
+      "processing_time_seconds": 48.93,
+      "warnings": [],
+      "error_message": ""
+    },
+    {
+      "file_path": "data\\raw\\vmware-nsx-gateway-firewall.pdf",
+      "doc_id": "2bec28389abeec06",
+      "status": "completed",
+      "vendor": "VMware",
+      "models_found": 1,
+      "chunks_created": 13,
+      "processing_time_seconds": 4.55,
+      "warnings": [],
+      "error_message": ""
+    }
+  ]
+}

@@ -36,11 +36,11 @@ logger = logging.getLogger(__name__)
 # Raised from 8 → 12: spec_text and spec_table chunks (model-specific numbers)
 # often rank lower than general prose for feature-style requirements.
 # More chunks ensures the numeric precheck and LLM both see actual spec values.
-TOP_K_PER_REQUIREMENT = 12
+TOP_K_PER_REQUIREMENT = 30
 
 # Minimum cosine similarity to keep a chunk as evidence.
 # Chunks below this are almost certainly irrelevant.
-MIN_SCORE = 0.30
+MIN_SCORE = 0.25
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,7 +167,76 @@ def build_candidate_products(
         eligible.items(),
         key=lambda x: (-x[1], -score_sum[x[0]], x[0][0], x[0][1]),
     )
-    return [product for product, _ in ranked]
+    products = [product for product, _ in ranked]
+    return _drop_power_feed_variants_when_base_exists(products)
+
+
+def expand_evidence_for_candidates(
+    requirements: List[Requirement],
+    vector_store,
+    evidence_map: Dict[str, List[EvidenceChunk]],
+    candidates: List[Tuple[str, str, str]],
+    per_product_k: int = 6,
+    min_score: float = 0.25,
+) -> Dict[str, List[EvidenceChunk]]:
+    """
+    Add product-filtered evidence for each shortlisted candidate.
+
+    The first retrieval pass is global and is good for finding candidates, but
+    it is not sufficient for scoring every candidate: a product's best chunk
+    may rank below the global top-K because another vendor has more similar
+    wording. This pass asks "for this requirement, what is the best evidence
+    for this specific product?" and merges those chunks into the evidence map.
+    """
+    expanded: Dict[str, List[EvidenceChunk]] = {
+        req_id: list(chunks) for req_id, chunks in evidence_map.items()
+    }
+
+    for req in requirements:
+        req_chunks = expanded.setdefault(req.requirement_id, [])
+        seen_ids = {chunk.chunk_id for chunk in req_chunks}
+        query = _build_query(req)
+
+        for vendor, model_name, _family in candidates:
+            try:
+                raw_results = vector_store.search(
+                    f"Technical specification requirement: {query}",
+                    n_results=per_product_k,
+                    vendor=vendor,
+                    model_name=model_name,
+                )
+            except Exception as exc:
+                logger.debug(
+                    f"Filtered search failed for {req.requirement_id} "
+                    f"{vendor} {model_name}: {exc}"
+                )
+                continue
+
+            for r in raw_results:
+                score = r.get("score", 0.0)
+                if score < min_score or r.get("id", "") in seen_ids:
+                    continue
+                seen_ids.add(r.get("id", ""))
+                raw_page = r.get("page_start") or r.get("metadata", {}).get("page_start", 0)
+                try:
+                    page_start = int(raw_page) if raw_page is not None else 0
+                except (ValueError, TypeError):
+                    page_start = 0
+                req_chunks.append(EvidenceChunk(
+                    chunk_id       = r.get("id", ""),
+                    text           = r.get("text", ""),
+                    score          = round(score, 4),
+                    vendor         = r.get("vendor", ""),
+                    model_name     = r.get("model_name", ""),
+                    product_family = r.get("product_family", ""),
+                    chunk_type     = r.get("chunk_type", ""),
+                    source_file    = r.get("source_file", ""),
+                    page_start     = page_start,
+                ))
+
+        req_chunks.sort(key=lambda c: c.score, reverse=True)
+
+    return expanded
 
 
 _MODEL_CODE_RE = re.compile(
@@ -196,13 +265,24 @@ def _is_rankable_product(
         return False
     if _MODEL_CODE_RE.search(model_name):
         return True
+    if _GENERIC_TITLE_RE.search(model_name):
+        return False
     if product_family and _SPEC_CHUNK_TYPES.intersection(seen_chunk_types):
         return True
-    if _GENERIC_TITLE_RE.search(model_name) and not _SPEC_CHUNK_TYPES.intersection(seen_chunk_types):
-        return False
-    if _GENERIC_TITLE_RE.search(model_name) and len(model_name.split()) > 4:
-        return False
     return bool(_SPEC_CHUNK_TYPES.intersection(seen_chunk_types))
+
+
+def _drop_power_feed_variants_when_base_exists(
+    products: List[Tuple[str, str, str]],
+) -> List[Tuple[str, str, str]]:
+    product_keys = {(vendor, model, family) for vendor, model, family in products}
+    out: List[Tuple[str, str, str]] = []
+    for vendor, model, family in products:
+        base = re.sub(r"-(?:AC|DC)$", "", model.upper())
+        if base != model.upper() and (vendor, base, family) in product_keys:
+            continue
+        out.append((vendor, model, family))
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════

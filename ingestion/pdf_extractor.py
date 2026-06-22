@@ -19,19 +19,11 @@ from PIL import Image
 
 from config.settings import OCRConfig, PDFConfig
 
-try:
-    from paddleocr import PaddleOCR
+import importlib.util
 
-    PADDLE_AVAILABLE = True
-    OCR_ENGINE = PaddleOCR(
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        lang="en"
-    )
-except ImportError:
-    PADDLE_AVAILABLE = False
-    logger.warning("PaddleOCR not available – OCR fallback disabled")
+PADDLE_AVAILABLE = importlib.util.find_spec("paddleocr") is not None
+OCR_ENGINE = None
+
 try:
     import cv2
     import numpy as np
@@ -91,12 +83,22 @@ def ocr_page_image(
     ocr_cfg: OCRConfig,
     psm: Optional[int] = None
     ) -> Tuple[str, float]:
+    global OCR_ENGINE
 
     if not PADDLE_AVAILABLE:
         return "", 0.0
 
     try:
         import numpy as np
+
+        if OCR_ENGINE is None:
+            from paddleocr import PaddleOCR
+            OCR_ENGINE = PaddleOCR(
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                lang="en"
+            )
 
         img = np.array(pil_image.convert("RGB"))
 

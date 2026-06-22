@@ -354,42 +354,37 @@ def chunk_document(
         if not text:
             continue
 
-        content_sig = hashlib.md5(text[:200].encode()).hexdigest()
+        clean_name = normalise_section_name(section_name)
+        content_sig = hashlib.md5(f"{clean_name}|{text[:500]}".encode()).hexdigest()
         if content_sig in family_sections_emitted:
             continue
         family_sections_emitted.add(content_sig)
 
-        clean_name = normalise_section_name(section_name)
         chunk_type = _section_to_chunk_type(clean_name, text)
 
-        # FIX-5: this header construction was previously a syntax error
-        # (a dangling concatenation with no opening assignment and no
-        # `model_header` prefix), which made the entire module fail to
-        # import. Family-level chunks aren't tied to one model, so the
-        # header identifies the family/vendor instead of a single model.
-        header = (
-            f"Vendor: {family_rep.vendor}"
-            + (f" | Family: {family_rep.product_family}" if family_rep.product_family else "")
-            + f"\nSection: {clean_name}\n\n"
-        )
-        full = header + text
-        size = _section_chunk_size(chunk_type, cfg)
-        for i, chunk_text in enumerate(_split_text(full, size, overlap=0)):
-            all_chunks.append(_make_chunk(
-                chunk_text, family_rep, doc, chunk_type, clean_name, index=i
-            ))
+        for model in doc.models:
+            header = (
+                f"Vendor: {model.vendor} | Model: {model.model_name}"
+                + (f" | Family: {model.product_family}" if model.product_family else "")
+                + f"\nSection: {clean_name}\n\n"
+            )
+            full = header + text
+            size = _section_chunk_size(chunk_type, cfg)
+            for i, chunk_text in enumerate(_split_text(full, size, overlap=0)):
+                all_chunks.append(_make_chunk(
+                    chunk_text, model, doc, chunk_type, clean_name, index=i
+                ))
 
     # Step B: Per-model spec profiles.
     # FIX-8: dedupe spec tables that are identical across multiple models
     # (e.g. a single shared performance table covering the whole family)
     # so the same table text isn't re-chunked once per model.
-    seen_table_hashes: Set[str] = set()
     for model in doc.models:
         all_chunks.extend(
             _chunks_for_model(
                 model, doc, cfg, emit_family=False,
                 skip_sections=is_family_level_section,
-                seen_table_hashes=seen_table_hashes,
+                seen_table_hashes=None,
             )
         )
 

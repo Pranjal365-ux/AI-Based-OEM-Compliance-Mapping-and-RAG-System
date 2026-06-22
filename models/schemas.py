@@ -266,3 +266,9 @@ class Requirement(BaseModel):
     unit: Optional[str] = None
 
     section: Optional[str] = None
+
+    # Requirement type classification:
+    #   "technical"   — verifiable against a datasheet (throughput, features, specs)
+    #   "procurement" — commercial/contractual (warranty, delivery, payment, licensing, SLA)
+    #   "operational" — deployment/support (training, documentation, staffing)
+    requirement_type: str = "technical"

@@ -160,10 +160,21 @@ class ComplianceEngine:
         # Candidates are pre-sorted by evidence frequency, so the most
         # relevant products are always evaluated first.
         max_candidates = min(len(candidates), self.top_n * 3)
+        shortlisted = candidates[:max_candidates]
+        logger.info(
+            f"  → Expanding evidence with product-filtered retrieval for "
+            f"{len(shortlisted)} shortlisted candidate(s)"
+        )
+        evidence_map = retrieval.expand_evidence_for_candidates(
+            requirements = requirements,
+            vector_store = self.vs,
+            evidence_map = evidence_map,
+            candidates   = shortlisted,
+        )
         top_products = ranker.rank_products(
             requirements = requirements,
             evidence_map = evidence_map,
-            candidates   = candidates[:max_candidates],
+            candidates   = shortlisted,
             top_n        = self.top_n,
         )
 

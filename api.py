@@ -81,16 +81,11 @@ class OEMKnowledgeBase:
     """
 
     def __init__(
-        self,
-        config: Optional[PipelineConfig] = None,
-        groq_api_key: Optional[str] = None,
+    self,
+    config: Optional[PipelineConfig] = None,
     ):
         from config.settings import DEFAULT_CONFIG
-        self._cfg = config or DEFAULT_CONFIG
-        if groq_api_key:
-            self._cfg.groq_api_key = groq_api_key
-        elif not self._cfg.groq_api_key:
-            self._cfg.groq_api_key = os.getenv("GROQ_API_KEY", "")
+        self._cfg = config or DEFAULT_CONFIG    
 
         self._pipeline = OEMIngestionPipeline(self._cfg)
         self._ready = False
